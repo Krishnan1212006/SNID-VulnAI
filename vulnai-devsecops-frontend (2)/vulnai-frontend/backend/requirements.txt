@@ -1,0 +1,17 @@
+# requirements.txt
+fastapi
+uvicorn[standard]
+pymongo
+pydantic-settings
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt==4.0.1
+python-multipart
+httpx
+beautifulsoup4
+reportlab
+pandas
+scikit-learn
+dnspython
+email-validator

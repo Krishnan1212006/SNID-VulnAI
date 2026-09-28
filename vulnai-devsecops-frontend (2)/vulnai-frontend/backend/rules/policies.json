@@ -1,0 +1,134 @@
+{
+  "rules": [
+    {
+      "rule_id": "HSTS_MISSING",
+      "title": "Missing HTTP Strict Transport Security (HSTS)",
+      "severity": "medium",
+      "category": "security_headers",
+      "owasp_id": "A05:2021-Security Misconfiguration",
+      "cwe_id": "CWE-319",
+      "description": "The HTTP Strict Transport Security header is missing on an HTTPS response, leaving the site vulnerable to protocol downgrade attacks.",
+      "remediation_template": "Add 'Strict-Transport-Security: max-age=31536000; includeSubDomains' to your HTTPS server configuration."
+    },
+    {
+      "rule_id": "X_FRAME_OPTIONS_MISSING",
+      "title": "Missing X-Frame-Options Header",
+      "severity": "low",
+      "category": "security_headers",
+      "owasp_id": "A05:2021-Security Misconfiguration",
+      "cwe_id": "CWE-1021",
+      "description": "The X-Frame-Options or Content-Security-Policy frame-ancestors directive is missing. The site may be vulnerable to Clickjacking.",
+      "remediation_template": "Add 'X-Frame-Options: SAMEORIGIN' or a restrictive 'Content-Security-Policy' frame-ancestors directive."
+    },
+    {
+      "rule_id": "X_CONTENT_TYPE_OPTIONS_MISSING",
+      "title": "Missing X-Content-Type-Options Header",
+      "severity": "low",
+      "category": "security_headers",
+      "owasp_id": "A05:2021-Security Misconfiguration",
+      "cwe_id": "CWE-434",
+      "description": "The X-Content-Type-Options header is missing, allowing browsers to perform MIME sniffing.",
+      "remediation_template": "Add 'X-Content-Type-Options: nosniff' to all server responses."
+    },
+    {
+      "rule_id": "CSP_MISSING",
+      "title": "Missing Content-Security-Policy",
+      "severity": "medium",
+      "category": "security_headers",
+      "owasp_id": "A03:2021-Injection",
+      "cwe_id": "CWE-79",
+      "description": "A Content Security Policy (CSP) restricts the resources a page can load. It is absent here.",
+      "remediation_template": "Implement a robust Content-Security-Policy header."
+    },
+    {
+      "rule_id": "COOKIE_NOT_SECURE",
+      "title": "Insecure Cookie (Missing Secure Flag)",
+      "severity": "high",
+      "category": "cookies",
+      "owasp_id": "A05:2021-Security Misconfiguration",
+      "cwe_id": "CWE-614",
+      "description": "A cookie was set without the Secure attribute. It could be transmitted in plaintext if the user accesses the site via HTTP.",
+      "remediation_template": "Append the 'Secure' flag to all sensitive cookies."
+    },
+    {
+      "rule_id": "COOKIE_NO_HTTPONLY",
+      "title": "Cookie Missing HttpOnly Flag",
+      "severity": "high",
+      "category": "cookies",
+      "owasp_id": "A07:2021-Identification and Authentication Failures",
+      "cwe_id": "CWE-1004",
+      "description": "A cookie was set without the HttpOnly attribute, making it accessible to client-side scripts and vulnerable to XSS theft.",
+      "remediation_template": "Append the 'HttpOnly' flag to all Sensitive cookies."
+    },
+    {
+      "rule_id": "SERVER_DISCLOSURE",
+      "title": "Server Version Disclosure",
+      "severity": "low",
+      "category": "information_disclosure",
+      "owasp_id": "A05:2021-Security Misconfiguration",
+      "cwe_id": "CWE-200",
+      "description": "The Server HTTP header exposes the server's identity and potentially its version number.",
+      "remediation_template": "Configure the web server to omit or obfuscate the 'Server' header."
+    },
+    {
+      "rule_id": "X_POWERED_BY_DISCLOSURE",
+      "title": "Framework Disclosure (X-Powered-By)",
+      "severity": "low",
+      "category": "information_disclosure",
+      "owasp_id": "A05:2021-Security Misconfiguration",
+      "cwe_id": "CWE-200",
+      "description": "The X-Powered-By HTTP header reveals the application framework running on the server.",
+      "remediation_template": "Remove the 'X-Powered-By' header in your application framework configuration."
+    },
+    {
+      "rule_id": "CORS_MISCONFIGURATION",
+      "title": "Overly Permissive CORS Policy",
+      "severity": "high",
+      "category": "misconfiguration",
+      "owasp_id": "A05:2021-Security Misconfiguration",
+      "cwe_id": "CWE-346",
+      "description": "The Access-Control-Allow-Origin header is set to '*', allowing any origin to interact with the resources.",
+      "remediation_template": "Restrict 'Access-Control-Allow-Origin' to specific, trusted domains."
+    },
+    {
+      "rule_id": "MIXED_CONTENT",
+      "title": "Mixed Content (HTTP links on HTTPS page)",
+      "severity": "medium",
+      "category": "encryption",
+      "owasp_id": "A02:2021-Cryptographic Failures",
+      "cwe_id": "CWE-319",
+      "description": "The HTTPS page includes resources loaded over plaintext HTTP, bypassing transport layer encryption.",
+      "remediation_template": "Ensure all resources (images, scripts, styles) are loaded via HTTPS."
+    },
+    {
+      "rule_id": "OPTIONS_METHOD_ENABLED",
+      "title": "HTTP OPTIONS Method Allowed",
+      "severity": "info",
+      "category": "information_disclosure",
+      "owasp_id": "A05:2021-Security Misconfiguration",
+      "cwe_id": "CWE-15",
+      "description": "The HTTP OPTIONS method is enabled, which may expose allowed HTTP methods and API endpoints.",
+      "remediation_template": "Disable the OPTIONS method if it is not required for application functionality such as CORS."
+    },
+    {
+      "rule_id": "TLS_EXPIRED",
+      "title": "TLS/SSL Certificate Expired",
+      "severity": "critical",
+      "category": "encryption",
+      "owasp_id": "A02:2021-Cryptographic Failures",
+      "cwe_id": "CWE-295",
+      "description": "The TLS certificate for this site has expired, causing browsers to reject the connection.",
+      "remediation_template": "Renew and re-deploy the TLS certificate immediately."
+    },
+    {
+      "rule_id": "SPF_MISSING",
+      "title": "Missing SPF Record",
+      "severity": "low",
+      "category": "dns",
+      "owasp_id": "A05:2021-Security Misconfiguration",
+      "cwe_id": "CWE-358",
+      "description": "Sender Policy Framework (SPF) restricts who can send emails on behalf of a domain. Missing here.",
+      "remediation_template": "Publish an SPF TXT record for the domain."
+    }
+  ]
+}

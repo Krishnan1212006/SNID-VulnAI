@@ -1,0 +1,150 @@
+@import "tailwindcss";
+
+/*
+  VulnAI-DevSecOps — editorial design system.
+  A restrained, single-accent palette in the spirit of a security intelligence
+  briefing rather than a glowing AI dashboard: ink neutrals, one brass signal
+  color, muted functional severity tones, hairline rules instead of glow.
+*/
+@theme {
+  --font-display: "Fraunces", "Iowan Old Style", serif;
+  --font-body: "IBM Plex Sans", "Helvetica Neue", sans-serif;
+  --font-mono: "IBM Plex Mono", "SF Mono", monospace;
+
+  /* neutrals */
+  --color-bg-main: #0B0B0D;
+  --color-bg-secondary: #131315;
+  --color-bg-card: #17171A;
+  --color-text-main: #F3F1EC;
+  --color-text-secondary: #A6A49E;
+  --color-text-muted: #6D6B66;
+  --color-border: #29292E;
+
+  /* signature accent (brass) + secondary ink accent (slate) */
+  --color-purple: #C6A15B;
+  --color-purple-bright: #E3C480;
+  --color-blue: #5E7A88;
+  --color-blue-bright: #8FA8B3;
+
+  /* functional severity, muted / desaturated */
+  --color-critical: #A83B42;
+  --color-high: #B5692B;
+  --color-medium: #9C8536;
+  --color-low: #4F7A5E;
+  --color-safe: #4A7A78;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--color-bg-main);
+  color: var(--color-text-main);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  position: relative;
+  min-height: 100vh;
+}
+
+/* a quiet vignette — depth without color bloom */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(ellipse 90% 60% at 50% -10%, rgba(198, 161, 91, 0.05), transparent 60%),
+    radial-gradient(ellipse 70% 50% at 100% 100%, rgba(0, 0, 0, 0.35), transparent 60%),
+    var(--color-bg-main);
+  pointer-events: none;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--color-bg-secondary); }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-purple); }
+
+/* small caps eyebrow labels, used throughout for section/kicker text */
+.kicker {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.text-accent {
+  color: var(--color-purple);
+}
+
+/* flat, solid signature button — no gradients */
+.btn-signature {
+  background-color: var(--color-purple);
+  color: #0B0B0D;
+  transition: background-color 0.2s ease, transform 0.15s ease;
+}
+.btn-signature:hover { background-color: var(--color-purple-bright); }
+.btn-signature:active { transform: scale(0.985); }
+
+.btn-outline {
+  border: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  transition: border-color 0.2s ease, color 0.2s ease;
+}
+.btn-outline:hover {
+  border-color: var(--color-purple);
+  color: var(--color-text-main);
+}
+
+/* flat card, hairline border — the base surface throughout the app */
+.card {
+  background-color: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+}
+
+.card-hover {
+  transition: border-color 0.2s ease, transform 0.15s ease;
+}
+.card-hover:hover {
+  border-color: #45433c;
+  transform: translateY(-1px);
+}
+
+.rule {
+  border-top: 1px solid var(--color-border);
+}
+
+/* signature decorative motif: redacted briefing lines */
+.redacted-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.redacted-lines span {
+  display: block;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--color-border);
+}
+
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-in-up { animation: fade-in-up 0.45s ease both; }
+
+@keyframes soft-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+.soft-pulse { animation: soft-pulse 2.2s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .fade-in-up, .soft-pulse { animation: none !important; }
+  html { scroll-behavior: auto; }
+}
+
+@media print {
+  body::before { display: none; }
+}

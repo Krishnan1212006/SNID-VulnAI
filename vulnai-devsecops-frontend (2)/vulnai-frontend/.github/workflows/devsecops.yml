@@ -1,0 +1,75 @@
+name: VulnAI DevSecOps Security Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  semgrep-sast:
+    name: Semgrep SAST Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: "p/default"
+          generateSarif: "1"
+          
+  pytest-validation:
+    name: Backend Unit Tests executing Risk Models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - name: Install Dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install pytest httpx
+      - name: Execute Test Coverage
+        run: |
+          cd backend
+          pytest tests/ --disable-warnings -v
+          
+  docker-trivy-scan:
+    name: Trivy Container Image Scan
+    runs-on: ubuntu-latest
+    needs: [semgrep-sast, pytest-validation]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build Backend Image
+        run: docker build -t vulnai/backend:latest ./backend
+      - name: Build Frontend Image
+        run: docker build -t vulnai/frontend:latest .
+      - name: Run Trivy over Backend Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'vulnai/backend:latest'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+      - name: Run Trivy over Frontend Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'vulnai/frontend:latest'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+  owasp-zap-dast:
+    name: OWASP ZAP DAST Target Verification
+    runs-on: ubuntu-latest
+    needs: docker-trivy-scan
+    steps:
+      - name: Execute ZAP Baseline Scan Against Staging
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          target: 'http://localhost:5173/'
+          fail_action: false

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "performing-web-application-penetration-test": {
+      "source": "mukul975/Anthropic-Cybersecurity-Skills",
+      "sourceType": "github",
+      "skillPath": "skills/performing-web-application-penetration-test/SKILL.md",
+      "computedHash": "b2229e25e04f74c310704fb006547dfe5ca507bde2ea46683243f435bad86690"
+    },
+    "performing-web-application-scanning-with-nikto": {
+      "source": "mukul975/Anthropic-Cybersecurity-Skills",
+      "sourceType": "github",
+      "skillPath": "skills/performing-web-application-scanning-with-nikto/SKILL.md",
+      "computedHash": "183dc0b1d027071a151e0352e45fe6d06ef99ddc5d297cb84ef8d0f7c207ef6a"
+    },
+    "performing-web-application-vulnerability-triage": {
+      "source": "mukul975/Anthropic-Cybersecurity-Skills",
+      "sourceType": "github",
+      "skillPath": "skills/performing-web-application-vulnerability-triage/SKILL.md",
+      "computedHash": "d5f6030c8ed7c3a30309c35b5b1f12cdbefc5b7b77e9bc648e26a41fdd0623dd"
+    }
+  }
+}
