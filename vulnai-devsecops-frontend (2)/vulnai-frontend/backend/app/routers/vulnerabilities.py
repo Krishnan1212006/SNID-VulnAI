@@ -7,6 +7,31 @@ from app.schemas.vulnerability import VulnerabilityResponse, VulnerabilityUpdate
 
 router = APIRouter()
 
+
+@router.get("/unified-observations")
+async def get_latest_unified_observations(current_user: dict = Depends(get_current_user)):
+    """Return normalized observations from the owner's latest unified assessment."""
+    db = get_database()
+    scan = await db.scans.find_one(
+        {"owner_id": str(current_user["_id"]), "unified_mode": True, "combined_results": {"$exists": True}},
+        sort=[("ended_at", -1)],
+    )
+    if not scan:
+        return {"scan_id": None, "target": None, "status": "not_available",
+                "confirmed": [], "potential": [], "informational": [], "incomplete": []}
+
+    results = scan.get("combined_results", {})
+    return {
+        "scan_id": str(scan["_id"]),
+        "target": results.get("target", scan.get("target_url")),
+        "status": results.get("status", scan.get("status")),
+        "confirmed": results.get("confirmed", []),
+        "potential": results.get("potential", []),
+        "informational": results.get("informational", []),
+        "incomplete": results.get("incomplete", []),
+    }
+
+
 @router.get("/", response_model=List[VulnerabilityResponse])
 async def get_vulnerabilities(
     status: Optional[str] = None,

@@ -206,3 +206,48 @@ def parse_gobuster(
         })
 
     return findings
+
+
+def parse_gobuster_observations(raw_output: str) -> List[Dict[str, Any]]:
+    """Parse Gobuster hits as unverified observations, not vulnerabilities."""
+    observations: List[Dict[str, Any]] = []
+    if not isinstance(raw_output, str) or not raw_output.strip():
+        return observations
+
+    for line_number, line in enumerate(raw_output.splitlines(), start=1):
+        raw_line = line.strip()
+        match = GOBUSTER_LINE.match(raw_line)
+        if not match or match.group(0).strip() != raw_line:
+            continue
+
+        try:
+            status_code = int(match.group(2))
+            response_size = int(match.group(3)) if match.group(3) is not None else None
+        except ValueError:
+            continue
+        if not 100 <= status_code <= 599:
+            continue
+
+        path = match.group(1)
+        if not path.startswith("/"):
+            path = f"/{path}"
+
+        observations.append({
+            "id": f"gobuster-{line_number}",
+            "scanner": "gobuster",
+            "source": "scan-results/gobuster.txt",
+            "path": path,
+            "title": f"Gobuster discovered {path}",
+            "status_code": status_code,
+            "response_size": response_size,
+            "method": None,
+            "redirect_to": match.group(4),
+            "severity": "informational",
+            "classification": "informational",
+            "status": "unverified",
+            "verification_status": "unverified",
+            "message": raw_line,
+            "raw_line": raw_line,
+        })
+
+    return observations

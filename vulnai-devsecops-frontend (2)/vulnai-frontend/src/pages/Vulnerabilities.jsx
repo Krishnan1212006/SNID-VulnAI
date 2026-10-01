@@ -18,6 +18,12 @@ export default function Vulnerabilities() {
   const [query, setQuery] = useState("");
   const [activeLevels, setActiveLevels] = useState([]);
   const [vulnerabilities, setVulnerabilities] = useState([]);
+  const [niktoFindings, setNiktoFindings] = useState([]);
+  const [niktoError, setNiktoError] = useState("");
+  const [gobusterObservations, setGobusterObservations] = useState([]);
+  const [gobusterError, setGobusterError] = useState("");
+  const [unifiedObservations, setUnifiedObservations] = useState(null);
+  const [unifiedObservationsError, setUnifiedObservationsError] = useState("");
 
   useEffect(() => {
     async function fetchVulns() {
@@ -29,6 +35,36 @@ export default function Vulnerabilities() {
       }
     }
     fetchVulns();
+
+    async function fetchNiktoFindings() {
+      try {
+        const res = await api.get("/scans/nikto");
+        setNiktoFindings(res.data.flatMap((scan) => scan.normalized_findings || []));
+      } catch (err) {
+        setNiktoError(err.message || "Failed to load Nikto findings");
+      }
+    }
+    fetchNiktoFindings();
+
+    async function fetchGobusterObservations() {
+      try {
+        const res = await api.get("/scans/gobuster");
+        setGobusterObservations(res.data.observations || []);
+      } catch (err) {
+        setGobusterError(err.message || "Failed to load Gobuster observations");
+      }
+    }
+    fetchGobusterObservations();
+
+    async function fetchUnifiedObservations() {
+      try {
+        const res = await api.get("/vulnerabilities/unified-observations");
+        setUnifiedObservations(res.data);
+      } catch (err) {
+        setUnifiedObservationsError(err.message || "Failed to load unified assessment observations");
+      }
+    }
+    fetchUnifiedObservations();
   }, []);
 
   function toggleLevel(level) {
@@ -149,6 +185,94 @@ export default function Vulnerabilities() {
       <div className="rounded-2xl border border-cyan-500/20 bg-[#070D1B]/60 shadow-[0_0_40px_rgba(0,0,0,0.6)] backdrop-blur-2xl overflow-hidden">
         <VulnerabilityTable items={filtered} />
       </div>
+
+      <section className="space-y-3 border-t border-cyan-500/20 pt-5">
+        <div>
+          <h2 className="text-sm font-bold uppercase tracking-wider text-cyan-200">Latest Unified Assessment</h2>
+          <p className="mt-1 text-xs text-slate-400">Normalized scanner observations remain unverified unless explicitly classified as confirmed.</p>
+        </div>
+        {unifiedObservationsError ? (
+          <p className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">Unified results unavailable: {unifiedObservationsError}</p>
+        ) : !unifiedObservations || unifiedObservations.status === "not_available" ? (
+          <p className="rounded-lg border border-cyan-500/20 bg-[#070D1B]/60 px-4 py-3 text-sm text-slate-400">No unified assessment results found.</p>
+        ) : (
+          <div className="divide-y divide-cyan-500/15 overflow-hidden rounded-xl border border-cyan-500/20 bg-[#070D1B]/60">
+            {["confirmed", "potential", "informational", "incomplete"].map((classification) => (
+              <article key={classification} className="space-y-2 px-4 py-3">
+                <p className="font-mono text-[11px] uppercase text-cyan-300">{classification}: {unifiedObservations[classification]?.length || 0}</p>
+                {(unifiedObservations[classification] || []).map((observation, index) => (
+                  <div key={observation.id || `${classification}-${index}`} className="break-words text-xs text-slate-400">
+                    <span className="text-slate-200">{observation.title || observation.path || observation.message}</span>
+                    <span className="text-slate-500"> · {observation.scanner || "scanner"} · {observation.verification_status || "unverified"}</span>
+                  </div>
+                ))}
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="space-y-3 border-t border-cyan-500/20 pt-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-bold uppercase tracking-wider text-cyan-200">Nikto scanner findings</h2>
+            <p className="mt-1 text-xs text-slate-400">Raw scanner observations are unverified and are not included in confirmed vulnerability totals.</p>
+          </div>
+          <span className="font-mono text-xs text-slate-400">{niktoFindings.length} observations</span>
+        </div>
+
+        {niktoError ? (
+          <p className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">Nikto results unavailable: {niktoError}</p>
+        ) : niktoFindings.length === 0 ? (
+          <p className="rounded-lg border border-cyan-500/20 bg-[#070D1B]/60 px-4 py-3 text-sm text-slate-400">No Nikto observations found.</p>
+        ) : (
+          <div className="divide-y divide-cyan-500/15 overflow-hidden rounded-xl border border-cyan-500/20 bg-[#070D1B]/60">
+            {niktoFindings.map((finding) => (
+              <article key={finding.id} className="space-y-2 px-4 py-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`rounded border px-2 py-0.5 font-mono text-[10px] uppercase ${finding.severity === "potential" ? "border-amber-500/40 text-amber-300" : "border-slate-600 text-slate-300"}`}>
+                    {finding.severity}
+                  </span>
+                  <span className="rounded border border-slate-700 px-2 py-0.5 font-mono text-[10px] uppercase text-slate-400">{finding.status}</span>
+                  <span className="font-mono text-[10px] text-slate-500">Nikto {finding.scanner_id} · {finding.method}</span>
+                </div>
+                <p className="break-words text-sm text-slate-200">{finding.raw_message}</p>
+                <p className="break-all font-mono text-[11px] text-slate-500">{finding.target_url}</p>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="space-y-3 border-t border-cyan-500/20 pt-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-bold uppercase tracking-wider text-cyan-200">Gobuster Observations</h2>
+            <p className="mt-1 text-xs text-slate-400">Informational path discoveries are unverified and are not vulnerabilities.</p>
+          </div>
+          <span className="font-mono text-xs text-slate-400">{gobusterObservations.length} observations</span>
+        </div>
+
+        {gobusterError ? (
+          <p className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">Gobuster results unavailable: {gobusterError}</p>
+        ) : gobusterObservations.length === 0 ? (
+          <p className="rounded-lg border border-cyan-500/20 bg-[#070D1B]/60 px-4 py-3 text-sm text-slate-400">No Gobuster observations found.</p>
+        ) : (
+          <div className="divide-y divide-cyan-500/15 overflow-hidden rounded-xl border border-cyan-500/20 bg-[#070D1B]/60">
+            {gobusterObservations.map((observation) => (
+              <article key={observation.id} className="space-y-2 px-4 py-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded border border-slate-600 px-2 py-0.5 font-mono text-[10px] uppercase text-slate-300">{observation.classification}</span>
+                  <span className="rounded border border-slate-700 px-2 py-0.5 font-mono text-[10px] uppercase text-slate-400">{observation.verification_status}</span>
+                  <span className="font-mono text-[10px] text-slate-500">HTTP {observation.status_code} · {observation.response_size ?? "unknown"} bytes</span>
+                </div>
+                <p className="break-all font-mono text-sm text-slate-200">{observation.path}</p>
+                <p className="break-words font-mono text-[11px] text-slate-500">{observation.message}</p>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
 
     </div>
   );

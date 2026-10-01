@@ -8,6 +8,7 @@ class ScanCreate(BaseModel):
     authorized: bool = Field(..., description="Must confirm authorization")
     lab_mode: bool = False
     kali_mode: bool = False
+    unified_mode: bool = False
 
 class ScanResponse(BaseModel):
     id: str
@@ -24,8 +25,11 @@ class ScanResponse(BaseModel):
     total_findings: Optional[int] = 0
     severity_summary: Optional[Dict[str, int]] = {}
     kali_mode: Optional[bool] = False
+    unified_mode: Optional[bool] = False
     lab_mode: Optional[bool] = False
     scanner_status: Optional[Dict[str, str]] = {}
+    scanner_details: Optional[Dict[str, Any]] = {}
+    runtime_status: Optional[Dict[str, Any]] = None
     evidence_files: Optional[Dict[str, str]] = {}
     report_html_path: Optional[str] = None
     report_md_path: Optional[str] = None

@@ -19,6 +19,9 @@ export default function ScanPage() {
   const [terminalLines, setTerminalLines] = useState([]);
   const [error, setError] = useState("");
   const [scanResult, setScanResult] = useState(null);
+  const [assessmentResults, setAssessmentResults] = useState(null);
+  const [scanId, setScanId] = useState("");
+  const [scanTarget, setScanTarget] = useState("");
   const timerRef = useRef(null);
   const canvasRef = useRef(null);
   const navigate = useNavigate();
@@ -162,8 +165,12 @@ export default function ScanPage() {
       return;
     }
     let parsed;
+    const enteredTarget = url.trim();
+    const candidateTarget = /^[a-z][a-z0-9+.-]*:\/\//i.test(enteredTarget)
+      ? enteredTarget
+      : `https://${enteredTarget}`;
     try {
-      parsed = new URL(url.trim());
+      parsed = new URL(candidateTarget);
       if (!["http:", "https:"].includes(parsed.protocol)) throw new Error();
     } catch {
       setError("Enter a valid HTTP or HTTPS URL, e.g. https://your-app.local");
@@ -173,7 +180,9 @@ export default function ScanPage() {
       setError("You must confirm authorization before a scan can start.");
       return;
     }
-    if (isBlockedTarget(url)) {
+    const normalizedTarget = parsed.toString();
+    setScanTarget(normalizedTarget);
+    if (isBlockedTarget(normalizedTarget)) {
       setError("Private/internal targets are blocked unless Lab Mode is enabled.");
       return;
     }
@@ -184,11 +193,13 @@ export default function ScanPage() {
     setScannerStatus({});
     setTerminalLines([]);
     setScanResult(null);
+    setAssessmentResults(null);
+    setScanId("");
 
     try {
       const assetRes = await api.post("/assets/", {
         name: `Scan Target: ${parsed.hostname}`,
-        target_urls: [url],
+        target_urls: [normalizedTarget],
         environment: "development"
       });
       const assetId = assetRes.data.id;
@@ -197,32 +208,45 @@ export default function ScanPage() {
         asset_id: assetId,
         authorized: authorized,
         lab_mode: labMode,
-        kali_mode: comprehensiveMode
+        kali_mode: false,
+        unified_mode: comprehensiveMode,
+        target_urls: [normalizedTarget],
       });
       const scanId = scanRes.data.id;
+      setScanId(scanId);
 
       let pollingFails = 0;
 
       timerRef.current = setInterval(async () => {
         try {
-          const progRes = await api.get(`/scans/${scanId}/progress`);
+          const progRes = await api.get(comprehensiveMode
+            ? `/scans/${scanId}/assessment-status`
+            : `/scans/${scanId}/progress`);
           const currentProgress = progRes.data.progress || 0;
           const status = progRes.data.status;
           setProgress(currentProgress);
-          setScannerStatus(progRes.data.scanner_status || {});
+          setScannerStatus(progRes.data.scanners || progRes.data.scanner_status || {});
 
           let newStep = Math.floor((currentProgress / 100) * scanCheckSteps.length);
           if (newStep >= scanCheckSteps.length) newStep = scanCheckSteps.length - 1;
           setStepIndex((currentStep) => Math.max(newStep, currentStep));
 
-          if (comprehensiveMode) {
-            const terminalRes = await api.get(`/scans/${scanId}/terminal`);
-            setTerminalLines(terminalRes.data.lines || []);
-          }
-
-          if (status === "completed" || status === "failed") {
+          if (["completed", "completed_with_failures", "failed", "incomplete"].includes(status)) {
             clearInterval(timerRef.current);
-            if (status === "completed") {
+            if (comprehensiveMode) {
+              const fullScan = await api.get(`/scans/${scanId}`);
+              setScannerStatus(fullScan.data.scanner_status || progRes.data.scanners || {});
+              try {
+                const resultsRes = await api.get(`/scans/${scanId}/assessment-results`);
+                setAssessmentResults(resultsRes.data);
+                setScanResult({ ...fullScan.data, status: resultsRes.data.status || status });
+                setState(STATE.DONE);
+              } catch (resultsError) {
+                if (status !== "failed") throw resultsError;
+                setState(STATE.IDLE);
+                setError(fullScan.data.error_message || "Assessment failed before unified results were available.");
+              }
+            } else if (status === "completed") {
               const fullScan = await api.get(`/scans/${scanId}`);
               setScanResult(fullScan.data);
               setState(STATE.DONE);
@@ -258,6 +282,9 @@ export default function ScanPage() {
     setTerminalLines([]);
     setError("");
     setScanResult(null);
+    setAssessmentResults(null);
+    setScanId("");
+    setScanTarget("");
     setComprehensiveMode(false);
   }
 
@@ -393,11 +420,14 @@ export default function ScanPage() {
               </div>
               <div>
                 <h2 className="text-base font-extrabold tracking-wider text-cyan-300 uppercase">
-                  Scanning Target: <span className="text-slate-100">{url}</span>
+                  Scanning Target: <span className="text-slate-100">{scanTarget || url}</span>
                 </h2>
                 <p className="text-[11px] text-slate-400">
                   {comprehensiveMode ? "Running authorized Nmap, Nikto, Wapiti, SQLMap, and Gobuster assessments..." : "Executing passive non-intrusive security checks..."}
                 </p>
+                {comprehensiveMode && (
+                  <p className="mt-1 text-[11px] text-slate-500">Scan ID: {scanId || "Preparing"} · Overall status: Running</p>
+                )}
               </div>
             </div>
 
@@ -418,13 +448,10 @@ export default function ScanPage() {
                   {Object.entries({ nmap: "Nmap", nikto: "Nikto", wapiti: "Wapiti", sqlmap: "SQLMap", gobuster: "Gobuster" }).map(([key, label]) => (
                     <div key={key} className="rounded-lg border border-slate-800 bg-[#03060D]/80 px-3 py-2">
                       <span className="block text-[10px] uppercase tracking-wider text-slate-500">{label}</span>
-                      <span className="mt-1 block text-[11px] font-bold text-cyan-300">{(scannerStatus[key] || "queued").toUpperCase()}</span>
+                      <span className="mt-1 block text-[11px] font-bold text-cyan-300">{String(scannerStatus[key] || "queued").replace("_", " ").toUpperCase()}</span>
                     </div>
                   ))}
                 </div>
-                <pre className="mb-4 max-h-64 overflow-auto rounded-xl border border-slate-800 bg-black/70 p-4 text-[10px] leading-relaxed text-slate-300 whitespace-pre-wrap">
-                  {terminalLines.slice(-100).join("\n") || "Waiting for scanner output..."}
-                </pre>
               </>
             ) : (
             <div className="space-y-2.5 rounded-xl bg-[#03060D]/80 p-4 border border-slate-800">
@@ -447,16 +474,114 @@ export default function ScanPage() {
 
         {/* DONE STATE */}
         {state === STATE.DONE && (
-          <div className="rounded-2xl border border-emerald-500/40 bg-[#070D1B]/90 p-6 sm:p-8 text-center shadow-[0_0_50px_rgba(16,185,129,0.15)] backdrop-blur-2xl">
-            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-emerald-400/50 bg-emerald-950/40 text-emerald-400 shadow-[0_0_25px_rgba(16,185,129,0.3)]">
-              <CheckCircle2 size={32} className="animate-bounce" />
+          <div className={`rounded-2xl border ${scanResult?.status === "failed" ? "border-rose-500/40" : ["completed_with_failures", "incomplete"].includes(scanResult?.status) ? "border-amber-500/40" : "border-emerald-500/40"} bg-[#070D1B]/90 p-6 sm:p-8 text-center shadow-[0_0_50px_rgba(16,185,129,0.15)] backdrop-blur-2xl`}>
+            <div className={`mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border ${scanResult?.status === "failed" ? "border-rose-400/50 bg-rose-950/40 text-rose-400" : ["completed_with_failures", "incomplete"].includes(scanResult?.status) ? "border-amber-400/50 bg-amber-950/40 text-amber-400" : "border-emerald-400/50 bg-emerald-950/40 text-emerald-400"}`}>
+              {scanResult?.status === "failed" ? <AlertTriangle size={32} /> : <CheckCircle2 size={32} />}
             </div>
-            <h2 className="text-xl font-extrabold tracking-widest text-slate-100 uppercase">Scan Complete</h2>
+            <h2 className="text-xl font-extrabold tracking-widest text-slate-100 uppercase">
+              {scanResult?.status === "failed" ? "Assessment Failed" : scanResult?.status === "incomplete" ? "Assessment Incomplete" : scanResult?.status === "completed_with_failures" ? "Assessment Completed with Failures" : "Scan Complete"}
+            </h2>
             <p className="mx-auto mt-2 max-w-md text-xs text-slate-400 leading-relaxed">
-              Target <span className="font-bold text-cyan-300">{url}</span> successfully assessed. Security posture score:{" "}
-              <span className="font-bold text-emerald-400">{scanResult?.security_score || 0}/100</span> with{" "}
-              <span className="font-bold text-rose-400">{scanResult?.total_findings || 0} findings</span> detected.
+              {scanResult?.status === "failed"
+                ? "Required scanners failed. Review each scanner status and its recorded error below."
+                : scanResult?.status === "completed_with_failures"
+                  ? "Some scanners failed. Findings below include only results from completed scanners."
+                  : scanResult?.status === "incomplete"
+                    ? "The assessment is incomplete because one or more required scanners were unavailable or skipped."
+                  : <>Target <span className="font-bold text-cyan-300">{url}</span> successfully assessed. Security posture score:{" "}
+                    <span className="font-bold text-emerald-400">{scanResult?.security_score || 0}/100</span>.</>}{" "}
+              <span className="font-bold text-rose-400">{scanResult?.total_findings || 0} confirmed findings</span>.
             </p>
+
+            {comprehensiveMode && (
+              <div className="mt-6 space-y-4 text-left">
+                <div className="grid gap-2 rounded-xl border border-cyan-500/20 bg-[#03060D]/70 p-4 text-xs sm:grid-cols-3">
+                  <p><span className="text-slate-500">Target</span><br /><span className="break-all text-cyan-200">{scanResult?.target_url || scanTarget}</span></p>
+                  <p><span className="text-slate-500">Scan ID</span><br /><span className="break-all text-slate-200">{scanId}</span></p>
+                  <p><span className="text-slate-500">Overall status</span><br /><span className={scanResult?.status === "failed" ? "text-rose-300" : scanResult?.status === "completed_with_failures" ? "text-amber-300" : "text-emerald-300"}>{scanResult?.status || "completed"}</span></p>
+                </div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                  {Object.entries({ nmap: "Nmap", nikto: "Nikto", wapiti: "Wapiti", sqlmap: "SQLMap", gobuster: "Gobuster" }).map(([key, label]) => (
+                    <div key={key} className="rounded-lg border border-slate-800 bg-[#03060D]/80 px-3 py-2 text-left">
+                      <span className="block text-[10px] uppercase text-slate-500">{label}</span>
+                      <span className="mt-1 block text-[11px] font-bold text-cyan-300">{String(scannerStatus[key] || "unknown").replace("_", " ").toUpperCase()}</span>
+                    </div>
+                  ))}
+                </div>
+                {(() => {
+                  const runtime = assessmentResults?.runtime_status || scanResult?.runtime_status;
+                  const details = assessmentResults?.scanner_details || scanResult?.scanner_details || {};
+                  return (
+                    <section className="rounded-xl border border-amber-500/20 bg-amber-950/10 p-4 text-xs">
+                      <h3 className="font-bold uppercase text-amber-200">Scanner runtime</h3>
+                      <p className="mt-2 text-slate-300">
+                        {runtime?.runtime?.toUpperCase() || "RUNTIME"} · {runtime?.distribution || "Local"} · {runtime?.status || "status unavailable"}
+                        {runtime?.distribution_state_before_command ? ` · Ubuntu ${runtime.distribution_state_before_command}` : ""}
+                      </p>
+                      {(runtime?.error || !runtime?.command_executable) && (
+                        <p className="mt-1 break-words text-rose-300">{runtime?.error || "Scanner runtime could not execute commands."}</p>
+                      )}
+                      {Object.entries(details).map(([scanner, detail]) => (
+                        <details key={scanner} className="mt-3 border-t border-slate-800 pt-2">
+                          <summary className="cursor-pointer text-slate-300">
+                            {scanner.toUpperCase()} · {detail.status} · {detail.duration ?? detail.execution_seconds ?? 0}s
+                            {detail.error ? ` · ${detail.error}` : ""}
+                          </summary>
+                          <p className="mt-2 break-words text-rose-300">stderr: {detail.stderr || "(empty)"}</p>
+                          <p className="mt-1 break-words text-slate-400">stdout: {detail.stdout || "(empty)"}</p>
+                        </details>
+                      ))}
+                    </section>
+                  );
+                })()}
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {[
+                    ["Confirmed findings", assessmentResults?.confirmed?.length || 0],
+                    ["Potential findings", assessmentResults?.potential?.length || 0],
+                    ["Informational observations", assessmentResults?.informational?.length || 0],
+                    ["Incomplete scanner results", assessmentResults?.incomplete?.length || 0],
+                  ].map(([label, count]) => (
+                    <div key={label} className="rounded-lg border border-slate-800 bg-[#03060D]/80 px-3 py-3">
+                      <span className="block text-[10px] text-slate-400">{label}</span>
+                      <span className="mt-1 block text-lg font-bold text-cyan-200">{count}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="space-y-3">
+                  {[
+                    ["confirmed", "Confirmed findings"],
+                    ["potential", "Potential findings"],
+                    ["informational", "Informational observations"],
+                    ["incomplete", "Incomplete scanner results"],
+                  ].map(([group, label]) => {
+                    const observations = assessmentResults?.[group] || [];
+                    return (
+                      <section key={group} className="border-t border-slate-800 pt-3">
+                        <h3 className="text-[11px] font-bold uppercase text-slate-300">{label}</h3>
+                        {observations.length === 0 ? (
+                          <p className="mt-1 text-[11px] text-slate-500">None</p>
+                        ) : (
+                          <ul className="mt-2 divide-y divide-slate-800">
+                            {observations.map((observation, index) => (
+                              <li key={observation.id || `${observation.scanner}-${index}`} className="space-y-1 py-2 text-[11px]">
+                                <p className="break-words font-semibold text-slate-200">{observation.title || observation.path || observation.message}</p>
+                                <p className="text-slate-500">{observation.scanner} · {observation.verification_status || observation.status || "unverified"}</p>
+                                {observation.status_code != null && (
+                                  <p className="font-mono text-slate-400">{observation.path} · HTTP {observation.status_code} · {observation.response_size ?? "unknown"} bytes</p>
+                                )}
+                                {(observation.message || observation.description) && (
+                                  <p className="break-words text-slate-500">{observation.message || observation.description}</p>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </section>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             <div className="mt-7 flex flex-col justify-center gap-3.5 sm:flex-row">
               <button

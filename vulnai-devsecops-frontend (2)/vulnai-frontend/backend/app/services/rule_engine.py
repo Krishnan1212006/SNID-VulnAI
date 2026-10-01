@@ -1,8 +1,8 @@
 import json
-import os
 from typing import Dict, Any, List
+from app.core.paths import APP_ROOT
 
-RULES_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "rules", "policies.json")
+RULES_PATH = APP_ROOT / "rules" / "policies.json"
 
 class RuleEngine:
     def __init__(self):

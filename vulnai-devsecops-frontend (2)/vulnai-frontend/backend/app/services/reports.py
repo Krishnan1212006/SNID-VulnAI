@@ -2,6 +2,7 @@ import io
 import json
 import csv
 from datetime import datetime
+from xml.sax.saxutils import escape
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -96,6 +97,46 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
                     elements.append(Paragraph(f"{i}. {step}", normal_style))
         
         elements.append(Spacer(1, 12))
+
+    combined_results = scan_data.get("combined_results") or {}
+    if combined_results:
+        elements.append(Paragraph("Unified Scanner Results", h2_style))
+        scanner_status = combined_results.get("scanner_status", {})
+        scanner_details = combined_results.get("scanner_details", {})
+        for scanner, scanner_state in scanner_status.items():
+            detail = scanner_details.get(scanner, {})
+            elements.append(Paragraph(
+                escape(f"{scanner}: {scanner_state} (exit code: {detail.get('exit_code')})"),
+                normal_style,
+            ))
+
+        for classification in ("confirmed", "potential", "informational", "incomplete"):
+            observations = combined_results.get(classification, [])
+            elements.append(Spacer(1, 8))
+            elements.append(Paragraph(f"{classification.title()} Observations ({len(observations)})", h3_style))
+            if not observations:
+                elements.append(Paragraph("None.", normal_style))
+                continue
+            for observation in observations:
+                scanner = escape(str(observation.get("scanner", "unknown")))
+                title = escape(str(observation.get("title") or observation.get("path") or observation.get("message") or "Scanner observation"))
+                elements.append(Paragraph(f"<b>{scanner}:</b> {title}", normal_style))
+                verification = escape(str(observation.get("verification_status", "unverified")))
+                elements.append(Paragraph(f"<b>Classification:</b> {classification} | <b>Verification:</b> {verification}", normal_style))
+                status_code = observation.get("status_code")
+                if status_code is not None:
+                    elements.append(Paragraph(
+                        escape(f"HTTP {status_code}; {observation.get('response_size', 'unknown')} bytes"),
+                        normal_style,
+                    ))
+                output_file = observation.get("evidence", {}).get("raw_output_file") if isinstance(observation.get("evidence"), dict) else None
+                output_file = output_file or observation.get("raw_output_file")
+                if output_file:
+                    elements.append(Paragraph(f"<b>Evidence:</b> {escape(str(output_file))}", normal_style))
+                description = observation.get("description") or observation.get("raw_line") or observation.get("message")
+                if description:
+                    elements.append(Paragraph(escape(str(description)[:1200]), normal_style))
+                elements.append(Spacer(1, 6))
         
     doc.build(elements)
     buffer.seek(0)
@@ -129,6 +170,7 @@ def generate_json(scan_data: dict, vulns_data: list) -> io.StringIO:
             "started_at": str(scan_data.get("started_at")),
             "risk_score": scan_data.get("risk_score", {})
         },
+        "combined_results": _json_safe(scan_data.get("combined_results", {})),
         "vulnerabilities": []
     }
     for v in vulns_data:
@@ -143,3 +185,15 @@ def generate_json(scan_data: dict, vulns_data: list) -> io.StringIO:
     json.dump(payload, buffer, indent=2)
     buffer.seek(0)
     return buffer
+
+
+def _json_safe(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "__str__") and value.__class__.__name__ == "ObjectId":
+        return str(value)
+    return value

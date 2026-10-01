@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 from typing import List
 import os
 from bson import ObjectId
@@ -10,9 +12,98 @@ from app.schemas.scan import ScanCreate, ScanResponse, ScanResultResponse
 from app.services.scanner import run_safe_scan
 from app.services.kali_scanner import run_kali_scan, run_wapiti_scan, get_terminal_output
 from app.core.config import settings
+from app.core.paths import SCAN_RESULTS_ROOT
 from app.routers.audit import log_audit_action
+from app.parsers.gobuster_parser import parse_gobuster_observations
+from app.services.unified_scan import AssessmentTargetError, run_unified_assessment, validate_assessment_target
+from app.services.unified_scan import SCANNER_BINARIES
+from app.services.scanner_runtime import scanner_runtime
 
 router = APIRouter()
+
+
+@router.get("/runtime-status")
+async def get_scanner_runtime_status(current_user: dict = Depends(get_current_user)):
+    """Check WSL and scanner executables without starting a scan."""
+    return await scanner_runtime.preflight_matrix(SCANNER_BINARIES)
+NIKTO_RESULT = SCAN_RESULTS_ROOT / "nikto.json"
+GOBUSTER_RESULT = SCAN_RESULTS_ROOT / "gobuster.txt"
+
+
+@router.get("/nikto")
+async def get_nikto_results(current_user: dict = Depends(get_current_user)):
+    if not NIKTO_RESULT.exists():
+        raise HTTPException(status_code=404, detail="Nikto result not found")
+
+    try:
+        with NIKTO_RESULT.open("r", encoding="utf-8") as result_file:
+            scans = json.load(result_file)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="Nikto result contains invalid JSON") from exc
+
+    if not isinstance(scans, list):
+        raise HTTPException(status_code=500, detail="Nikto result has an unsupported format")
+
+    for scan in scans:
+        host = scan.get("host", "")
+        port = scan.get("port")
+        is_https = port == 443 or bool(scan.get("ssl_info"))
+        scheme = "https" if is_https else "http"
+        host_url = f"{scheme}://{host}"
+        if port and port not in (80, 443):
+            host_url = f"{host_url}:{port}"
+
+        normalized_findings = []
+        for index, finding in enumerate(scan.get("vulnerabilities", [])):
+            message = finding.get("msg", "")
+            lower_message = message.lower()
+            lower_url = finding.get("url", "").lower()
+            potential = (
+                "vulnerability" in lower_message
+                or "phpinfo()" in lower_message
+                or "control panel" in lower_message
+                or "mail package installed" in lower_message
+                or "webmail" in lower_url
+                or "phpinfo.php" in lower_url
+                or "securecontrolpanel" in lower_url
+            )
+            finding_url = finding.get("url", "")
+            target_url = finding_url if finding_url.startswith(("http://", "https://")) else f"{host_url}/{finding_url.lstrip('/')}"
+            normalized_findings.append({
+                "id": f"{finding.get('id', 'nikto')}-{index}",
+                "scanner": "nikto",
+                "scanner_id": finding.get("id"),
+                "title": message,
+                "severity": "potential" if potential else "informational",
+                "status": "unverified",
+                "target_url": target_url,
+                "method": finding.get("method"),
+                "references": finding.get("references", ""),
+                "raw_message": message,
+            })
+        scan["normalized_findings"] = normalized_findings
+
+    return scans
+
+
+@router.get("/gobuster")
+async def get_gobuster_results(current_user: dict = Depends(get_current_user)):
+    if not GOBUSTER_RESULT.exists():
+        raise HTTPException(status_code=404, detail="Gobuster result not found")
+
+    try:
+        raw_output = GOBUSTER_RESULT.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Unable to read Gobuster result") from exc
+
+    return {
+        "scanner": "gobuster",
+        "source": "scan-results/gobuster.txt",
+        "status": "completed",
+        "raw_output": raw_output,
+        "observations": parse_gobuster_observations(raw_output),
+    }
+
 
 @router.post("/", response_model=ScanResponse, status_code=status.HTTP_201_CREATED)
 async def create_scan(
@@ -27,6 +118,9 @@ async def create_scan(
 
     if scan.kali_mode and not settings.kali_enabled:
         raise HTTPException(status_code=503, detail="Comprehensive scanner mode is disabled on this server.")
+
+    if scan.kali_mode and scan.unified_mode:
+        raise HTTPException(status_code=400, detail="Choose either legacy Kali mode or unified assessment mode.")
     
     if not scan.asset_id:
         raise HTTPException(status_code=400, detail="Asset ID is required to start a scan.")
@@ -46,6 +140,14 @@ async def create_scan(
     elif asset.get("target_urls") and len(asset["target_urls"]) > 0:
         target_url = asset["target_urls"][0]
 
+    if scan.unified_mode:
+        if not target_url:
+            raise HTTPException(status_code=400, detail="A target URL is required for unified assessment.")
+        try:
+            target_url = validate_assessment_target(target_url, lab_mode=scan.lab_mode)
+        except AssessmentTargetError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     new_scan = {
         "asset_id": scan.asset_id,
         "owner_id": str(current_user["_id"]),
@@ -53,6 +155,7 @@ async def create_scan(
         "progress": 0,
         "lab_mode": scan.lab_mode,
         "kali_mode": scan.kali_mode,
+        "unified_mode": scan.unified_mode,
         "target_url": target_url,
         "started_at": datetime.now(timezone.utc),
         "ended_at": None,
@@ -65,7 +168,9 @@ async def create_scan(
     
     # Launch background job based on scan mode. Prefer Wapiti for direct web scanning
     # unless the legacy Kali path is explicitly requested.
-    if scan.kali_mode:
+    if scan.unified_mode:
+        background_tasks.add_task(run_unified_assessment, scan_id, db)
+    elif scan.kali_mode:
         background_tasks.add_task(run_kali_scan, scan_id, db)
     else:
         background_tasks.add_task(run_wapiti_scan, scan_id, db)
@@ -106,6 +211,52 @@ async def get_scan_trends(current_user: dict = Depends(get_current_user)):
         
     return trendData
 
+
+@router.get("/{scan_id}/assessment-status")
+async def get_assessment_status(scan_id: str, current_user: dict = Depends(get_current_user)):
+    db = get_database()
+    try:
+        scan_object_id = ObjectId(scan_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid scan ID") from exc
+
+    scan = await db.scans.find_one({"_id": scan_object_id, "owner_id": str(current_user["_id"])})
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if not scan.get("unified_mode"):
+        raise HTTPException(status_code=400, detail="Scan is not a unified assessment")
+
+    return {
+        "scan_id": scan_id,
+        "target": scan.get("target_url"),
+        "status": scan.get("status", "unknown"),
+        "progress": scan.get("progress", 0),
+        "scanners": scan.get("scanner_status", {}),
+        "scanner_details": scan.get("scanner_details", {}),
+        "runtime_status": scan.get("runtime_status"),
+        "started_at": scan.get("started_at"),
+        "ended_at": scan.get("ended_at"),
+        "error_message": scan.get("error_message"),
+    }
+
+
+@router.get("/{scan_id}/assessment-results")
+async def get_assessment_results(scan_id: str, current_user: dict = Depends(get_current_user)):
+    db = get_database()
+    try:
+        scan_object_id = ObjectId(scan_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid scan ID") from exc
+
+    scan = await db.scans.find_one({"_id": scan_object_id, "owner_id": str(current_user["_id"])})
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if not scan.get("unified_mode"):
+        raise HTTPException(status_code=400, detail="Scan is not a unified assessment")
+    if not scan.get("combined_results"):
+        raise HTTPException(status_code=409, detail="Unified assessment results are not ready")
+    return scan["combined_results"]
+
 @router.get("/{scan_id}", response_model=ScanResponse)
 async def get_scan_status(scan_id: str, current_user: dict = Depends(get_current_user)):
     db = get_database()
@@ -129,6 +280,9 @@ async def get_scan_progress(scan_id: str, current_user: dict = Depends(get_curre
         "progress": s.get("progress", 0),
         "status": s.get("status", "unknown"),
         "scanner_status": s.get("scanner_status", {}),
+        "scanner_details": s.get("scanner_details", {}),
+        "unified_mode": s.get("unified_mode", False),
+        "target_url": s.get("target_url"),
         "kali_mode": s.get("kali_mode", False),
         "total_findings": s.get("total_findings", 0),
         "error_message": s.get("error_message")
@@ -331,4 +485,3 @@ async def get_scan_html_report(scan_id: str, current_user: dict = Depends(get_cu
             content = f.read()
         return HTMLResponse(content=content)
     raise HTTPException(status_code=404, detail="HTML report not yet generated or available.")
-
