@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from typing import List, Optional
-from bson import ObjectId
+from app.core.ids import ObjectId
 from app.database import get_database
 from app.dependencies import get_current_user
 from app.schemas.vulnerability import VulnerabilityResponse, VulnerabilityUpdate

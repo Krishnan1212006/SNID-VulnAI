@@ -1,15 +1,22 @@
 import asyncio
-from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import os
+from app.database import connect_to_postgres, close_postgres_connection, get_database
 
 load_dotenv()
-MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-CLIENT = AsyncIOMotorClient(MONGO_URI)
-DB = CLIENT["vulnai_platform"]
+DB = None
 
 async def seed():
+    global DB
+    await connect_to_postgres()
+    DB = get_database()
+    try:
+        await seed_data()
+    finally:
+        await close_postgres_connection()
+
+async def seed_data():
     # Grab the first user
     user = await DB.users.find_one({})
     if not user:

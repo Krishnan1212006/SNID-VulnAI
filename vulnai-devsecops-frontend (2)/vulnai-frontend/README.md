@@ -29,7 +29,7 @@ graph TD
     end
     
     %% Define Database Infrastructure
-    subgraph DB ["MongoDB"]
+    subgraph DB ["Neon Postgres"]
         Coll_Assets[Assets]
         Coll_Vulnerabilities[Vulnerabilities]
         Coll_Pipelines[Pipeline Runs]
@@ -61,16 +61,15 @@ graph TD
 
 ## Deployment Guide 🚀
 
-Deploying this architecture is entirely modular via **Docker Compose**:
+Deploying this architecture is entirely modular via **Docker Compose**. Set `DATABASE_URL` in your shell or the project-root `.env` file to your Neon Postgres connection string before starting the backend. Use the pooled connection string for application traffic.
 
 ### 1. Local Network Instantiation
 Clone the project locally and instantiate environmental bindings explicitly mapping ports natively:
 ```bash
 docker-compose up --build -d
 ```
-That instantly launches three robust containers mapped precisely over internal networks:
-- **`vulnai-mongo`**: MongoDB database instance available exclusively onto internal networks.
-- **`vulnai-backend`**: FastAPI endpoints spanning across `http://localhost:8000/api`.
+That launches the application containers:
+- **`vulnai-backend`**: FastAPI endpoints spanning across `http://localhost:8000/api`, connected to Neon Postgres.
 - **`vulnai-frontend`**: React App available instantly via `http://localhost:5173`.
 
 ### 2. Loading the Demo Topology

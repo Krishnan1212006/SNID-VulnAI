@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import List
-from bson import ObjectId
+from app.core.ids import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from app.database import get_database
 from app.dependencies import get_current_user

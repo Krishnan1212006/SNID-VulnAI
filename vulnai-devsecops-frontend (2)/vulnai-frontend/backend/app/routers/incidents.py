@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict, Any
-from bson import ObjectId
+from app.core.ids import ObjectId
 
 from app.database import get_database
 from app.dependencies import get_current_user

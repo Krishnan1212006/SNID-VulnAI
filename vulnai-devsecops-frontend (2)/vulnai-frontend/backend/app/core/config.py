@@ -5,8 +5,7 @@ class Settings(BaseSettings):
     app_name: str = "VulnAI DevSecOps API"
     environment: str = "development"
 
-    mongodb_uri: str = "mongodb://localhost:27017"
-    mongodb_database: str = "vulnai_db"
+    database_url: str = ""
 
     jwt_secret_key: str = "replace_this_with_a_long_random_secret_key"
     jwt_algorithm: str = "HS256"
@@ -32,7 +31,7 @@ class Settings(BaseSettings):
     kali_enabled: bool = True
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(APP_ROOT / ".env", APP_ROOT.parent / ".env"),
         case_sensitive=False,
         extra="ignore"
     )

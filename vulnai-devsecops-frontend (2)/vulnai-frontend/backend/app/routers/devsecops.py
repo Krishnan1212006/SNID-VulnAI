@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, status, Query
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
-from bson import ObjectId
+from app.core.ids import ObjectId
 
 from app.database import get_database
 from app.services.scanner import run_safe_scan

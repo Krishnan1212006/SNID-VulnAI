@@ -1,4 +1,4 @@
-from bson import ObjectId
+from app.core.ids import ObjectId
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt

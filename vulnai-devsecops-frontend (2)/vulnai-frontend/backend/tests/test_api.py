@@ -1,5 +1,5 @@
 import pytest
-from bson import ObjectId
+from app.core.ids import ObjectId
 from fastapi.testclient import TestClient
 from jose import jwt
 from app.main import app

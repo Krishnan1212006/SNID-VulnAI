@@ -3,7 +3,7 @@ Kali Linux Assessment Engine Integration Service.
 
 Securely invokes the authorized Bash scanner script (Nmap, Nikto, Wapiti, SQLMap, Gobuster),
 streams console execution output in real time, parses raw evidence files into
-normalized findings in MongoDB, and computes explainable risk scores.
+    normalized findings in Postgres, and computes explainable risk scores.
 """
 
 import asyncio
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 
-from bson import ObjectId
+from app.core.ids import ObjectId
 
 from app.core.config import settings
 from app.services.scanner import validate_url_for_ssrf, SSRFProtectionError

@@ -2,7 +2,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from typing import Dict
 from asyncio import sleep
 from app.database import get_database
-from bson import ObjectId
+from app.core.ids import ObjectId
 
 router = APIRouter()
 

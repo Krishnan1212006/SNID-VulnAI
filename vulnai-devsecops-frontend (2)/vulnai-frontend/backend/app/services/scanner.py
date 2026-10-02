@@ -4,7 +4,7 @@ import socket
 import urllib.parse
 import ipaddress
 from datetime import datetime, timezone
-from bson import ObjectId
+from app.core.ids import ObjectId
 import ssl
 from bs4 import BeautifulSoup
 import dns.resolver

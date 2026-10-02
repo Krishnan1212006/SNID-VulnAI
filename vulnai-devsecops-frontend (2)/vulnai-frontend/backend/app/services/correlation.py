@@ -1,6 +1,6 @@
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any
-from bson import ObjectId
+from app.core.ids import ObjectId
 
 async def correlate_incident(event: Dict[str, Any], event_id: str, db, owner_id: str):
     """

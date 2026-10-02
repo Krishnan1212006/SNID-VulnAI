@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.database import get_database
 from app.dependencies import get_current_user
 from app.schemas.iot import DeviceCreate, DeviceUpdate
-from bson import ObjectId
+from app.core.ids import ObjectId
 from datetime import datetime, timezone
 
 router = APIRouter()

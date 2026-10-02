@@ -73,7 +73,7 @@ const TECH_STACK = [
   { name: "React", category: "Frontend" },
   { name: "Vite", category: "Build Tool" },
   { name: "FastAPI", category: "Backend Engine" },
-  { name: "MongoDB", category: "Database" },
+  { name: "Neon Postgres", category: "Database" },
   { name: "Python", category: "Core Runtime" },
   { name: "Gemini AI", category: "AI Engine" },
   { name: "GitHub Actions", category: "DevSecOps" },

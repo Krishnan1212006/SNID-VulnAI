@@ -4,7 +4,7 @@ import sys
 from types import SimpleNamespace
 from pathlib import Path
 
-from bson import ObjectId
+from app.core.ids import ObjectId
 from fastapi.testclient import TestClient
 
 from app.dependencies import get_current_user

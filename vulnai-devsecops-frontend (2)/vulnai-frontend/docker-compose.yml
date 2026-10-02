@@ -1,15 +1,4 @@
 services:
-  mongodb:
-    image: mongo:6.0
-    container_name: vulnai-mongo
-    volumes:
-      - mongodb_data:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   backend:
     build: 
       context: ./backend
@@ -17,14 +6,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - MONGODB_URI=mongodb://mongodb:27017
+      - DATABASE_URL=${DATABASE_URL:-}
       - SECRET_KEY=vulnai_super_secret_for_docker
       - KALI_SCRIPT_PATH=/app/scripts/kali_scanner.sh
       - SCAN_OUTPUT_DIR=/app/scan-results
       - KALI_WORDLIST=/app/wordlist/common.txt
-    depends_on:
-      mongodb:
-        condition: service_healthy
     volumes:
       - scan_results:/app/scan-results
       - ./wordlist:/app/wordlist:ro
@@ -45,5 +31,4 @@ services:
       - backend
 
 volumes:
-  mongodb_data:
   scan_results:

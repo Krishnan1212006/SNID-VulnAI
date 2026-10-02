@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from bson import ObjectId
+from app.core.ids import ObjectId
 
 from app.parsers import parse_nmap, parse_nikto, parse_sqlmap, parse_wapiti
 from app.parsers.gobuster_parser import parse_gobuster_observations

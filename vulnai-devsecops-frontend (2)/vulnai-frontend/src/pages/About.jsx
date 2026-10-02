@@ -94,7 +94,7 @@ export default function About() {
             <div>
               <p className="kicker mb-2">Backend &amp; data</p>
               <p className="text-sm leading-relaxed text-text-secondary">
-                FastAPI and MongoDB, with a scanner service performing passive HTTP, TLS and
+                FastAPI and Neon Postgres, with a scanner service performing passive HTTP, TLS and
                 header checks, an AI service for explanation, and a rule-based correlation
                 engine for network and IoT signals.
               </p>

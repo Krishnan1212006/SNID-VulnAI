@@ -1,19 +1,27 @@
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.database import connect_to_mongo, close_mongo_connection
+from app.database import connect_to_postgres, close_postgres_connection
 from app.core.config import settings
 from app.routers import auth, scans, vulnerabilities, reports, assets, websockets, ai
 from app.routers import history, devices, events, incidents, network
 from app.routers import devsecops, monitoring, audit, risk, dashboard
 
+logger = logging.getLogger(__name__)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await connect_to_mongo()
-    yield
-    await close_mongo_connection()
+    try:
+        await connect_to_postgres()
+    except Exception:
+        logger.exception("Neon Postgres is unavailable; database-backed routes will return 503")
+    try:
+        yield
+    finally:
+        await close_postgres_connection()
 
 app = FastAPI(
     title="VulnAI DevSecOps API",

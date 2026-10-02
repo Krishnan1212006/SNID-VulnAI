@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from typing import List
 import os
-from bson import ObjectId
+from app.core.ids import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from app.database import get_database
@@ -111,8 +111,6 @@ async def create_scan(
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
-    db = get_database()
-    
     if not scan.authorized:
         raise HTTPException(status_code=400, detail="Cannot create scan without confirmed authorization.")
 
@@ -126,6 +124,7 @@ async def create_scan(
         raise HTTPException(status_code=400, detail="Asset ID is required to start a scan.")
     
     # Verify asset ownership
+    db = get_database()
     asset = await db.assets.find_one({
         "_id": ObjectId(scan.asset_id), 
         "owner_id": str(current_user["_id"])
