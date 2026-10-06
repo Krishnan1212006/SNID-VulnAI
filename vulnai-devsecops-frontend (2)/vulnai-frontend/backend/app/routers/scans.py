@@ -2,7 +2,7 @@ import copy
 from datetime import datetime, timezone, timedelta
 import json
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 import os
 from app.core.ids import ObjectId
 from app.services.scan_job_manager import scan_job_manager
@@ -424,6 +424,19 @@ async def get_assessment_results(scan_id: str, current_user: dict = Depends(get_
             }
         raise HTTPException(status_code=409, detail="Unified assessment results are not ready")
     return scan["combined_results"]
+
+@router.get("/latest", response_model=Optional[ScanResponse])
+async def get_latest_scan(current_user: dict = Depends(get_current_user)):
+    db = get_database()
+    scan = await db.scans.find_one({"owner_id": str(current_user["_id"])}, sort=[("started_at", -1)])
+    if not scan:
+        return None
+    scan["id"] = str(scan["_id"])
+    if scan.get("duration") is None:
+        scan["duration"] = _compute_scan_duration(scan)
+    if scan.get("completed_at") is None and scan.get("ended_at") is not None:
+        scan["completed_at"] = scan.get("ended_at")
+    return scan
 
 @router.get("/{scan_id}", response_model=ScanResponse)
 async def get_scan_status(scan_id: str, current_user: dict = Depends(get_current_user)):

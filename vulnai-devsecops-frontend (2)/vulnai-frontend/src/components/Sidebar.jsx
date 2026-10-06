@@ -13,7 +13,8 @@ import {
   LogOut,
   X,
   ClipboardList,
-  Cpu
+  Cpu,
+  History
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 
@@ -26,6 +27,7 @@ const NAV_SECTIONS = [
     label: "Web Security",
     items: [
       { to: "/scan", label: "New Scan", icon: ScanLine },
+      { to: "/last-scan", label: "Last Scan Records", icon: History },
       { to: "/vulnerabilities", label: "Vulnerabilities", icon: ShieldAlert },
       { to: "/reports", label: "Reports", icon: FileText },
     ],
