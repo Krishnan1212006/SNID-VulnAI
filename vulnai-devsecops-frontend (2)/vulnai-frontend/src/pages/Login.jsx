@@ -33,6 +33,23 @@ const LOG_MESSAGES = [
   "[AI_ENGINE]: CORRELATING_CVE_DATABASE..."
 ];
 
+function formatAuthError(error) {
+  const detail = error?.data?.detail;
+  if (Array.isArray(detail)) {
+    return detail.map((issue) => {
+      const field = Array.isArray(issue.loc)
+        ? issue.loc.filter((part) => part !== "body").join(".")
+        : "";
+      return [field, issue.msg || "Invalid value"].filter(Boolean).join(": ");
+    }).join("; ");
+  }
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object") {
+    return detail.message || detail.error || "Authentication request failed.";
+  }
+  return error?.message || "Authentication request failed.";
+}
+
 export default function Login() {
   const [mode, setMode] = useState("login"); // "login" | "register"
   const [direction, setDirection] = useState(1);
@@ -176,16 +193,12 @@ export default function Login() {
     try {
       setError("");
       if (mode === "register") {
-        try {
-          await api.post("/auth/register", { name, email, password });
-        } catch {
-          // Backend offline — continue to mock login
-        }
+        await api.post("/auth/register", { name, email, password });
       }
       await login(email, password);
       navigate("/dashboard");
     } catch (err) {
-      setError(`AUTH_ERROR: ${err.message}`);
+      setError(`AUTH_ERROR: ${formatAuthError(err)}`);
     }
   }
 
@@ -423,6 +436,28 @@ export default function Login() {
 
               {/* Input Form Controls */}
               <form onSubmit={handleSubmit} className="space-y-4">
+                {mode === "login" && (
+                  <div className="flex items-center justify-between p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs">
+                    <div className="flex items-center gap-2 text-emerald-300">
+                      <Sparkles size={14} className="text-emerald-400 shrink-0" />
+                      <span className="font-mono text-[11px]">
+                        Demo: <strong className="text-white">student@example.com</strong> / <strong className="text-white">abikrishna</strong>
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEmail("student@example.com");
+                        setPassword("abikrishna");
+                        setError("");
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-emerald-500 text-slate-950 font-bold text-[10px] uppercase font-mono hover:bg-emerald-400 transition-all shadow-sm cursor-pointer"
+                    >
+                      Auto-Fill
+                    </button>
+                  </div>
+                )}
+
                 {mode === "register" && (
                   <Field 
                     icon={User} 

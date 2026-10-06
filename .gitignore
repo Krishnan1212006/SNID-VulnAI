@@ -8,3 +8,13 @@ venv/
 __pycache__/
 *.pyc
 .venv/
+.venv_fixed/
+
+# Scan runtime artifacts
+scan-results/
+**/scan-results/
+*result*.txt
+openapi.json
+
+# Nested repositories and vendor
+ARES/

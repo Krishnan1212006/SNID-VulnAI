@@ -5,7 +5,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from app.core.config import settings
 
@@ -46,7 +46,7 @@ class ScannerRuntime:
             return ["wsl.exe", "-d", self.distribution, "--", *command]
         return list(command)
 
-    async def capture_host(self, command: Sequence[str], timeout: float = 10) -> CommandResult:
+    async def capture_host(self, command: Sequence[str], timeout: Optional[float] = 60) -> CommandResult:
         started = time.perf_counter()
         if os.name == "nt":
             return await asyncio.to_thread(self._capture_sync, list(command), timeout, started)
@@ -59,21 +59,162 @@ class ScannerRuntime:
         except (OSError, ValueError) as exc:
             return CommandResult("failed", None, b"", b"", str(exc) or repr(exc), time.perf_counter() - started)
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            communicate_coro = process.communicate()
+            if timeout is not None:
+                stdout, stderr = await asyncio.wait_for(communicate_coro, timeout=timeout)
+            else:
+                stdout, stderr = await communicate_coro
             code = process.returncode
             return CommandResult("completed" if code == 0 else "failed", code, stdout, stderr,
                                  None if code == 0 else f"Command exited with code {code}", time.perf_counter() - started)
         except asyncio.TimeoutError:
-            process.kill()
+            self._terminate_process_tree(process)
             stdout, stderr = await process.communicate()
             return CommandResult("timed_out", process.returncode, stdout, stderr,
                                  f"Command exceeded its {timeout}-second timeout", time.perf_counter() - started)
 
-    async def capture_runtime(self, command: Sequence[str], timeout: float = 10) -> CommandResult:
+    async def capture_runtime(self, command: Sequence[str], timeout: Optional[float] = 60) -> CommandResult:
         return await self.capture_host(self.wrap_runtime_command(command), timeout)
 
-    async def run_command(self, command: Sequence[str], timeout: float) -> CommandResult:
-        """Run an already built command and retain partial output after timeouts."""
+    @staticmethod
+    def _terminate_process_tree(process: Any) -> None:
+        """Terminate a process and its child processes to avoid zombie or orphan tasks."""
+        if not process:
+            return
+        pid = getattr(process, "pid", None)
+        if not pid:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            else:
+                import signal
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except Exception:
+                    process.terminate()
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    async def run_streaming_command(
+        self,
+        command: Sequence[str],
+        on_stdout: Optional[Any] = None,
+        on_stderr: Optional[Any] = None,
+        cancel_event: Optional[asyncio.Event] = None,
+        timeout: Optional[float] = None,
+        on_process_created: Optional[Any] = None,
+    ) -> CommandResult:
+        """Run a scanner command without artificial limits, streaming output live and supporting cancellation."""
+        started = time.perf_counter()
+        cmd_list = list(command)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd_list,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (OSError, ValueError) as exc:
+            return CommandResult("failed", None, b"", b"", str(exc) or repr(exc), time.perf_counter() - started)
+
+        if on_process_created:
+            try:
+                on_process_created(process)
+            except Exception:
+                pass
+
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+
+        async def read_stream(stream: asyncio.StreamReader, is_stderr: bool) -> None:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                if is_stderr:
+                    stderr_chunks.append(line)
+                    if on_stderr:
+                        try:
+                            on_stderr(decode_output(line))
+                        except Exception:
+                            pass
+                else:
+                    stdout_chunks.append(line)
+                    if on_stdout:
+                        try:
+                            on_stdout(decode_output(line))
+                        except Exception:
+                            pass
+
+        stdout_task = asyncio.create_task(read_stream(process.stdout, False))
+        stderr_task = asyncio.create_task(read_stream(process.stderr, True))
+        wait_task = asyncio.create_task(process.wait())
+
+        # Build monitor coroutine
+        status = "completed"
+        error_msg = None
+
+        if cancel_event:
+            cancel_task = asyncio.create_task(cancel_event.wait())
+            tasks_to_wait = {wait_task, cancel_task}
+        else:
+            cancel_task = None
+            tasks_to_wait = {wait_task}
+
+        try:
+            if timeout:
+                done, pending = await asyncio.wait(tasks_to_wait, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                done, pending = await asyncio.wait(tasks_to_wait, return_when=asyncio.FIRST_COMPLETED)
+
+            if wait_task in done:
+                code = wait_task.result()
+                status = "completed" if code == 0 else "failed"
+                error_msg = None if code == 0 else f"Command exited with code {code}"
+            elif cancel_task and cancel_task in done:
+                status = "cancelled"
+                error_msg = "Scan was cancelled by the user"
+                self._terminate_process_tree(process)
+                await wait_task
+            else:
+                # Timeout occurred
+                status = "timed_out"
+                error_msg = f"Scanner exceeded the safety limit of {timeout}s"
+                self._terminate_process_tree(process)
+                await wait_task
+        except Exception as exc:
+            self._terminate_process_tree(process)
+            status = "failed"
+            error_msg = str(exc)
+        finally:
+            if cancel_task and not cancel_task.done():
+                cancel_task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+        full_stdout = b"".join(stdout_chunks)
+        full_stderr = b"".join(stderr_chunks)
+        code = process.returncode
+
+        return CommandResult(
+            status=status,
+            exit_code=code,
+            stdout=full_stdout,
+            stderr=full_stderr,
+            error=error_msg,
+            duration=time.perf_counter() - started,
+        )
+
+    async def run_command(self, command: Sequence[str], timeout: Optional[float] = None) -> CommandResult:
+        """Run an already built command without an arbitrary timeout limit unless explicitly specified."""
         started = time.perf_counter()
         if os.name == "nt":
             return await asyncio.to_thread(self._run_sync, list(command), timeout, started)
@@ -86,7 +227,11 @@ class ScannerRuntime:
         except (OSError, ValueError) as exc:
             return CommandResult("failed", None, b"", b"", str(exc) or repr(exc), time.perf_counter() - started)
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            communicate_coro = process.communicate()
+            if timeout is not None:
+                stdout, stderr = await asyncio.wait_for(communicate_coro, timeout=timeout)
+            else:
+                stdout, stderr = await communicate_coro
             code = process.returncode
             status = "timed_out" if code in (124, 137) else ("completed" if code == 0 else "failed")
             error = None if status == "completed" else (
@@ -95,13 +240,13 @@ class ScannerRuntime:
             )
             return CommandResult(status, code, stdout, stderr, error, time.perf_counter() - started)
         except asyncio.TimeoutError:
-            process.kill()
+            self._terminate_process_tree(process)
             stdout, stderr = await process.communicate()
             return CommandResult("timed_out", process.returncode, stdout, stderr,
                                  f"Command exceeded its {timeout}-second timeout", time.perf_counter() - started)
 
     @staticmethod
-    def _capture_sync(command: Sequence[str], timeout: float, started: float) -> CommandResult:
+    def _capture_sync(command: Sequence[str], timeout: Optional[float], started: float) -> CommandResult:
         try:
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     timeout=timeout, check=False)
@@ -116,7 +261,7 @@ class ScannerRuntime:
             return CommandResult("failed", None, b"", b"", str(exc) or repr(exc), time.perf_counter() - started)
 
     @staticmethod
-    def _run_sync(command: Sequence[str], timeout: float, started: float) -> CommandResult:
+    def _run_sync(command: Sequence[str], timeout: Optional[float], started: float) -> CommandResult:
         try:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except (OSError, ValueError) as exc:
@@ -130,7 +275,10 @@ class ScannerRuntime:
                 else f"Command exited with code {code}"
             )
         except subprocess.TimeoutExpired:
-            process.kill()
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, timeout=5, check=False)
+            except Exception:
+                process.kill()
             stdout, stderr = process.communicate()
             code = process.returncode
             status = "timed_out"

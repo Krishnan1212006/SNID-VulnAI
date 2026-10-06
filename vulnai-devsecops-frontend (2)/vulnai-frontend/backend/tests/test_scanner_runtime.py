@@ -136,7 +136,7 @@ def test_command_results_preserve_success_failure_and_timeout():
     async def run():
         success = await runtime.run_command([sys.executable, "-c", "print('ok')"], 3)
         failure = await runtime.run_command([sys.executable, "-c", "import sys; print('bad', file=sys.stderr); sys.exit(9)"], 3)
-        timeout = await runtime.run_command([sys.executable, "-c", "import time; print('started', flush=True); time.sleep(2)"], 0.05)
+        timeout = await runtime.run_command([sys.executable, "-c", "import time; print('started', flush=True); time.sleep(2)"], 0.4)
         return success, failure, timeout
 
     success, failure, timeout = asyncio.run(run())

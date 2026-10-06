@@ -16,8 +16,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     try:
         await connect_to_postgres()
-    except Exception:
-        logger.exception("Neon Postgres is unavailable; database-backed routes will return 503")
+    except Exception as error:
+        logger.error(
+            "Neon Postgres initialization failed (%s); database-backed routes will return 503",
+            type(error).__name__,
+        )
     try:
         yield
     finally:

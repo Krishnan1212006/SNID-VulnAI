@@ -200,9 +200,12 @@ export default function Reports() {
                     <span className="truncate">{scan.target_urls?.[0] || scan.asset_id}</span>
                   </div>
 
-                  {/* Date Column */}
+                  {/* Date & Duration Column */}
                   <div className="text-xs text-slate-400 md:col-span-2 font-mono">
-                    {scan.started_at ? new Date(scan.started_at).toLocaleDateString() : "-"}
+                    <div>{scan.started_at ? new Date(scan.started_at).toLocaleDateString() : "-"}</div>
+                    {scan.duration != null && scan.duration > 0 && (
+                      <div className="text-[10px] text-cyan-400/80 font-bold mt-0.5">⏱️ {Math.round(scan.duration)}s</div>
+                    )}
                   </div>
 
                   {/* Score Column */}

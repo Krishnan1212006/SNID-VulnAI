@@ -3,6 +3,7 @@
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -10,8 +11,10 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
+
+logger = logging.getLogger(__name__)
 
 import httpx
 from app.core.ids import ObjectId
@@ -22,8 +25,11 @@ from app.core.paths import SCAN_RESULTS_ROOT, WORDLIST_PATH
 from app.services.risk_scoring import compute_scan_risk
 from app.services.scanner import SSRFProtectionError, validate_url_for_ssrf
 from app.services.scanner_runtime import decode_output, scanner_runtime
+from app.services.scan_job_manager import scan_job_manager
 from app.core.config import settings
-SCANNERS = ("nmap", "nikto", "wapiti", "sqlmap", "gobuster")
+CORE_SCANNERS = ("nmap", "nikto", "wapiti", "sqlmap", "gobuster")
+ALL_SCANNERS = ("nmap", "nikto", "wapiti", "sqlmap", "gobuster", "wappalyzer")
+SCANNERS = CORE_SCANNERS
 
 
 def _is_docker_container() -> bool:
@@ -37,7 +43,9 @@ def _is_wsl_host() -> bool:
 def _preferred_runtime(scanner: str) -> str:
     if scanner == "nikto" and (_is_wsl_host() or _is_docker_container()):
         return "wsl"
-    return SCANNER_BINARIES[scanner]["runtime"]
+    if scanner in SCANNER_BINARIES:
+        return SCANNER_BINARIES[scanner]["runtime"]
+    return "python"
 
 
 SCANNER_BINARIES = {
@@ -46,6 +54,7 @@ SCANNER_BINARIES = {
     "wapiti": {"runtime": "wsl", "binary": "wapiti"},
     "sqlmap": {"runtime": "wsl", "binary": "sqlmap"},
     "gobuster": {"runtime": "wsl", "binary": "gobuster"},
+    "wappalyzer": {"runtime": "python", "binary": "wappalyzer"},
 }
 
 
@@ -60,39 +69,66 @@ def _scanner_runtime_specs() -> Dict[str, Dict[str, Any]]:
 
 
 SCANNER_CONCURRENCY_LIMIT = 5
-SCANNER_TIMEOUTS = {
-    "nmap": 180,
-    "nikto": 240,
-    "wapiti": 300,
-    "sqlmap": 120,
-    "gobuster": 180,
-}
 SCANNER_WSL_DISTRIBUTION = settings.scanner_wsl_distribution
-class AssessmentTargetError(ValueError):
-    """Raised when an assessment target is invalid or blocked by SSRF rules."""
 
 
-async def _run_wappalyzer(target: str) -> Dict[str, Any]:
-    """Run the existing passive technology detector as supplemental metadata."""
+async def _persist_scanner_job(db, scan_id: str, tool_name: str, detail: Dict[str, Any]) -> None:
+    if not hasattr(db, "scanner_jobs"):
+        return
+    job_id = f"{scan_id}_{tool_name}"
+    doc = {
+        "job_id": job_id,
+        "scan_id": scan_id,
+        "tool_name": tool_name,
+        "status": detail.get("status", "queued"),
+        "started_at": detail.get("started_at"),
+        "completed_at": detail.get("completed_at"),
+        "exit_code": detail.get("exit_code"),
+        "stdout": (detail.get("stdout") or "")[:50000],
+        "stderr": (detail.get("stderr") or "")[:50000],
+        "duration": detail.get("duration", 0.0),
+        "error_message": detail.get("error"),
+        "updated_at": _utc_now(),
+    }
+    try:
+        await db.scanner_jobs.update_one(
+            {"scan_id": scan_id, "tool_name": tool_name},
+            {"$set": doc},
+            upsert=True,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Failed to persist scanner_job for %s: %s", tool_name, exc)
+
+
+async def _run_wappalyzer(target: str, scan_id: Optional[str] = None) -> Dict[str, Any]:
+    """Run the passive technology fingerprinting engine without an artificial timeout limit."""
     try:
         from app.scanners.wappalyzer_scanner import WappalyzerScanner
 
-        result = await asyncio.wait_for(
-            asyncio.to_thread(WappalyzerScanner(target, timeout=10).scan),
-            timeout=12,
-        )
+        if scan_id and scan_job_manager.is_cancelled(scan_id):
+            return {
+                "tool": "Technology Fingerprinting",
+                "type": "technology_detection",
+                "target": target,
+                "status": "cancelled",
+                "technologies": [],
+                "technology_count": 0,
+                "error": "Scan was cancelled by user",
+                "classification": "informational",
+            }
+
+        scanner = WappalyzerScanner(target, timeout=settings.scan_job_timeout_seconds)
+        result = await asyncio.to_thread(scanner.scan)
+
+        if scan_id and scan_job_manager.is_cancelled(scan_id):
+            result["status"] = "cancelled"
+            result["error"] = "Scan was cancelled by user"
+            return result
+
         result["classification"] = "informational"
+        w_status = "completed" if result.get("status") not in ("failed", "error") else "failed"
+        result["status"] = w_status
         return result
-    except asyncio.TimeoutError:
-        return {
-            "tool": "Technology Fingerprinting",
-            "type": "technology_detection",
-            "target": target,
-            "status": "timed_out",
-            "technologies": [],
-            "error": "Technology fingerprinting exceeded its 12-second timeout.",
-            "classification": "informational",
-        }
     except Exception as exc:
         return {
             "tool": "Technology Fingerprinting",
@@ -100,9 +136,14 @@ async def _run_wappalyzer(target: str) -> Dict[str, Any]:
             "target": target,
             "status": "failed",
             "technologies": [],
+            "technology_count": 0,
             "error": str(exc),
             "classification": "informational",
         }
+
+
+class AssessmentTargetError(ValueError):
+    """Raised when an assessment target is invalid or blocked by SSRF rules."""
 
 
 def validate_assessment_target(target: str, lab_mode: bool = False) -> str:
@@ -246,11 +287,23 @@ async def _wildcard_response_size(target: str, host_header: Optional[str] = None
 
 async def _timed_process_command(
     command: Sequence[str],
-    timeout_seconds: float,
+    timeout_seconds: float = 0,
     grace_seconds: Optional[float] = None,
+    on_stdout: Optional[Callable[[str], None]] = None,
+    on_stderr: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    on_process_created: Optional[Callable[[Any], None]] = None,
 ) -> Dict[str, Any]:
     started_at = _utc_now()
-    result = await scanner_runtime.run_command(command, timeout_seconds + (grace_seconds or 0))
+    eff_timeout = (timeout_seconds + (grace_seconds or 0)) if (timeout_seconds and timeout_seconds > 0) else settings.scan_job_timeout_seconds
+    result = await scanner_runtime.run_streaming_command(
+        command,
+        on_stdout=on_stdout,
+        on_stderr=on_stderr,
+        cancel_event=cancel_event,
+        timeout=eff_timeout,
+        on_process_created=on_process_created,
+    )
     return {
         "status": result.status,
         "exit_code": result.exit_code,
@@ -262,11 +315,13 @@ async def _timed_process_command(
     }
 
 
-def aggregate_scanner_status(scanner_states: Dict[str, str]) -> str:
+def aggregate_scanner_status(scanner_states: Dict[str, str], is_cancelled: bool = False) -> str:
     """Return an overall terminal state that reflects every required scanner."""
+    if is_cancelled or any(state == "cancelled" for state in scanner_states.values()):
+        return "cancelled"
     if not scanner_states or any(state in {"queued", "running"} for state in scanner_states.values()):
         return "running"
-    terminal_states = {"completed", "failed", "timed_out", "unavailable", "skipped"}
+    terminal_states = {"completed", "failed", "timed_out", "unavailable", "skipped", "cancelled"}
     if any(state not in terminal_states for state in scanner_states.values()):
         return "running"
     if all(state == "completed" for state in scanner_states.values()):
@@ -290,15 +345,12 @@ async def _build_scanner_command(
         wsl_target = await _target_for_scanner_runtime(target, gateway)
         wsl_output_path = await _wsl_path(output_path)
         scanner_args = [
-            "nikto", "-h", wsl_target, "-nointeractive", "-Tuning", "12349",
-            "-timeout", "5", "-maxtime", f"{timeout_seconds}s", "-output", wsl_output_path, "-Format", "txt",
+            "nikto", "-h", wsl_target, "-nointeractive", "-output", wsl_output_path, "-Format", "txt",
         ]
         host_header = _runtime_host_header(target) if _is_wsl_host() else None
         if host_header:
             scanner_args.extend(["-vhost", host_header])
-        command = scanner_runtime.wrap_runtime_command([
-            "timeout", "--signal=TERM", "--kill-after=5s", f"{timeout_seconds}s", *scanner_args,
-        ])
+        command = scanner_runtime.wrap_runtime_command(scanner_args)
         return command, output_path
     if scanner == "nikto":
         docker_target = _target_for_docker(target)
@@ -306,8 +358,7 @@ async def _build_scanner_command(
             settings.scanner_docker_command, "run", "--rm",
             "--add-host", "host.docker.internal:host-gateway",
             settings.nikto_docker_image,
-            "-h", docker_target, "-nointeractive", "-Tuning", "12349",
-            "-timeout", "5", "-maxtime", f"{timeout_seconds}s", "-Format", "txt",
+            "-h", docker_target, "-nointeractive", "-Format", "txt",
         ]
         return command, output_path
 
@@ -322,7 +373,6 @@ async def _build_scanner_command(
     elif scanner == "wapiti":
         scanner_args = [
             "wapiti", "-u", wsl_target, "--scope", "page", "-d", "1", "--tasks", "1",
-            "--max-scan-time", str(timeout_seconds), "--max-attack-time", "15",
             "--store-session", await _wsl_path(output_dir / "wapiti-session"),
             "--no-bugreport", "-f", "txt", "-o", wsl_output_path,
         ]
@@ -332,7 +382,7 @@ async def _build_scanner_command(
     elif scanner == "sqlmap":
         scanner_args = [
             "sqlmap", "-u", wsl_target, "--batch", "--risk=1", "--level=1",
-            "--technique=BEU", "--threads=1", "--timeout=5", "--retries=0",
+            "--technique=BEU", "--threads=1",
             f"--output-dir={await _wsl_path(output_dir / 'sqlmap-data')}",
         ]
         host_header = _runtime_host_header(target)
@@ -352,9 +402,7 @@ async def _build_scanner_command(
     else:
         raise ValueError(f"Unsupported scanner: {scanner}")
 
-    command = scanner_runtime.wrap_runtime_command([
-        "timeout", "--signal=TERM", "--kill-after=5s", f"{timeout_seconds}s", *scanner_args,
-    ])
+    command = scanner_runtime.wrap_runtime_command(scanner_args)
     return command, output_path
 
 async def _write_status_file(output_dir: Path, status_data: Dict[str, Any]) -> None:
@@ -441,10 +489,11 @@ def _write_markdown_report(
         "| Scanner | Status | Exit code | Evidence |",
         "|---|---|---:|---|",
     ]
-    for scanner in SCANNERS:
-        detail = scanner_details[scanner]
+    for scanner in ALL_SCANNERS:
+        detail = scanner_details.get(scanner, {})
+        evidence_file = f"scan-results/{scan_id}/wappalyzer.json" if scanner == "wappalyzer" else f"scan-results/{scan_id}/{scanner}.txt"
         lines.append(
-            f"| {scanner} | {scanner_status[scanner]} | {detail.get('exit_code')} | `scan-results/{scan_id}/{scanner}.txt` |"
+            f"| {scanner} | {scanner_status.get(scanner, 'unknown')} | {detail.get('exit_code')} | `{evidence_file}` |"
         )
         # Technology Detection
     if technology_detection:
@@ -496,7 +545,7 @@ def _write_markdown_report(
 
 
 async def _run_unified_assessment(scan_id: str, db) -> None:
-    """Run the five scanners concurrently and persist independent outcomes."""
+    """Run the 6 scanners concurrently and persist independent outcomes."""
     scan = await db.scans.find_one({"_id": ObjectId(scan_id)})
     if not scan or scan.get("status") == "cancelled":
         return
@@ -504,6 +553,8 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
     target = scan.get("target_url")
     output_dir = SCAN_RESULTS_ROOT / scan_id
     output_dir.mkdir(parents=True, exist_ok=True)
+    scan_job_manager.register_scan(scan_id, target, list(ALL_SCANNERS))
+    overall_started = time.perf_counter()
     status_data: Dict[str, Any] = {
         "scan_id": scan_id,
         "target": target,
@@ -518,26 +569,29 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
                 "duration": 0.0, "error": None, "classification": "unverified",
                 "started_at": None, "completed_at": None,
             }
-            for name in SCANNERS
+            for name in ALL_SCANNERS
         },
     }
     state_lock = asyncio.Lock()
 
     async def update_scanner(name: str, detail: Dict[str, Any]) -> None:
         async with state_lock:
-            status_data["scanners"][name] = detail["status"]
+            if name in status_data["scanners"]:
+                status_data["scanners"][name] = detail["status"]
             status_data["scanner_details"][name] = detail
-            finished = sum(value in {"completed", "failed", "timed_out", "unavailable", "skipped"} for value in status_data["scanners"].values())
+            finished = sum(value in {"completed", "failed", "timed_out", "unavailable", "skipped", "cancelled"} for value in status_data["scanners"].values())
+            is_cancelled = scan_job_manager.is_cancelled(scan_id)
             await db.scans.update_one(
                 {"_id": ObjectId(scan_id)},
                 {"$set": {
-                    "status": "running",
+                    "status": "cancelled" if is_cancelled else "running",
                     "progress": int(finished * 100 / len(SCANNERS)),
                     "scanner_status": dict(status_data["scanners"]),
                     "scanner_details": dict(status_data["scanner_details"]),
                     "runtime_status": status_data.get("runtime_status"),
                 }},
             )
+            await _persist_scanner_job(db, scan_id, name, detail)
             await _write_status_file(output_dir, status_data)
 
     try:
@@ -608,7 +662,18 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
     scanner_semaphore = asyncio.Semaphore(SCANNER_CONCURRENCY_LIMIT)
 
     async def run_one(scanner: str) -> None:
-        timeout_seconds = SCANNER_TIMEOUTS[scanner]
+        if scan_job_manager.is_cancelled(scan_id):
+            detail = status_data["scanner_details"][scanner]
+            detail.update({
+                "status": "cancelled",
+                "completed_at": _utc_now(),
+                "error": "Scan was cancelled by user",
+                "failure_stage": "cancelled",
+            })
+            await update_scanner(scanner, detail)
+            return
+
+        timeout_seconds = settings.scan_job_timeout_seconds
         execution_started = time.perf_counter()
         detail: Dict[str, Any] = {
             "scanner": scanner,
@@ -617,6 +682,7 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             "target": normalized_target,
             "stdout": "",
             "stderr": "",
+            "output": "",
             "exit_code": None,
             "duration": 0.0,
             "classification": "unverified",
@@ -629,34 +695,17 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             "error": None,
             "failure_stage": "command_construction",
         }
+        scan_job_manager.start_tool(scan_id, scanner)
         await update_scanner(scanner, detail)
         stdout_path = output_dir / f"{scanner}.stdout.txt"
         stderr_path = output_dir / f"{scanner}.stderr.txt"
         output_path = output_dir / f"{scanner}.txt"
-        availability = runtime_status.get("scanners", {}).get(scanner, {})
-        unavailable_error = None if availability.get("available") else (
-            availability.get("error") or runtime_status.get("error") or "Scanner runtime is unavailable"
-        )
-        if gateway_error:
-            unavailable_error = gateway_error
-        if unavailable_error:
-            raw_stdout = str(availability.get("stdout") or "").encode("utf-8")
-            raw_stderr = str(availability.get("stderr") or "").encode("utf-8")
-            detail.update({
-                "status": "unavailable",
-                "completed_at": _utc_now(),
-                "failure_stage": "runtime_preflight",
-                "error": unavailable_error,
-                "stdout": _decode_command_output(raw_stdout),
-                "stderr": _decode_command_output(raw_stderr),
-            })
-            output_path.write_bytes(b"")
-            stdout_path.write_bytes(raw_stdout)
-            stderr_path.write_bytes(raw_stderr)
-            detail["duration"] = round(time.perf_counter() - execution_started, 3)
-            detail["execution_seconds"] = detail["duration"]
-            await update_scanner(scanner, detail)
-            return
+        stdout_path.write_bytes(b"")
+        stderr_path.write_bytes(b"")
+        output_path.write_bytes(b"")
+
+        # Don't skip any scanner: always build command and attempt actual process execution
+
         try:
             detail["execution_target"] = (
                 _target_for_docker(normalized_target)
@@ -670,38 +719,118 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             detail["command"] = list(command)
             detail["executable"] = command[0] if command else None
             detail["failure_stage"] = "process_execution"
-            process_result = await _timed_process_command(command, timeout_seconds)
-            stdout = process_result.pop("stdout")
-            stderr = process_result.pop("stderr")
-            stdout_path.write_bytes(stdout)
-            stderr_path.write_bytes(stderr)
-            if not output_path.exists():
-                output_path.write_bytes(stdout)
-            detail.update(process_result)
-            output_error = _scanner_output_error(scanner, stdout, output_path)
-            if detail.get("status") == "completed" and output_error:
-                detail.update(
-                    status="failed",
-                    error=output_error,
-                    failure_stage="result_validation",
+
+            def on_out(line: str):
+                try:
+                    with open(stdout_path, "a", encoding="utf-8", errors="replace") as f:
+                        f.write(line)
+                    with open(output_path, "a", encoding="utf-8", errors="replace") as f:
+                        f.write(line)
+                except Exception:
+                    pass
+                scan_job_manager.append_output(scan_id, scanner, stdout_text=line)
+
+            def on_err(line: str):
+                try:
+                    with open(stderr_path, "a", encoding="utf-8", errors="replace") as f:
+                        f.write(line)
+                except Exception:
+                    pass
+                scan_job_manager.append_output(scan_id, scanner, stderr_text=line)
+
+            def on_proc(p):
+                scan_job_manager.attach_process(scan_id, scanner, p)
+
+            ctx = scan_job_manager.get_scan(scan_id)
+            cancel_evt = ctx.cancel_event if ctx else None
+
+            try:
+                raw_res = await _timed_process_command(
+                    command,
+                    timeout_seconds=settings.scan_job_timeout_seconds,
+                    on_stdout=on_out,
+                    on_stderr=on_err,
+                    cancel_event=cancel_evt,
+                    on_process_created=on_proc,
                 )
-            detail["stdout"] = _decode_command_output(stdout)
-            detail["stderr"] = _decode_command_output(stderr)
+            except TypeError:
+                raw_res = await _timed_process_command(command, settings.scan_job_timeout_seconds)
+
+            if isinstance(raw_res, dict):
+                p_status = raw_res.get("status", "completed")
+                p_exit_code = raw_res.get("exit_code", 0)
+                stdout = raw_res.get("stdout", b"")
+                stderr = raw_res.get("stderr", b"")
+                p_error = raw_res.get("error")
+            else:
+                p_status = raw_res.status
+                p_exit_code = raw_res.exit_code
+                stdout = raw_res.stdout
+                stderr = raw_res.stderr
+                p_error = raw_res.error
+
+            if stdout and not stdout_path.read_bytes():
+                stdout_path.write_bytes(stdout)
+            if stderr and not stderr_path.read_bytes():
+                stderr_path.write_bytes(stderr)
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                output_path.write_bytes(stdout)
+
+            if p_status == "cancelled" or scan_job_manager.is_cancelled(scan_id):
+                detail.update(
+                    status="cancelled",
+                    exit_code=p_exit_code,
+                    error="Scan was cancelled by the user",
+                    failure_stage="cancelled",
+                    completed_at=_utc_now(),
+                )
+            elif p_status == "timed_out":
+                detail.update(
+                    status="timed_out",
+                    exit_code=p_exit_code,
+                    error=f"Scanner exceeded the job safety limit of {settings.scan_job_timeout_seconds}s",
+                    failure_stage="job_timeout",
+                    completed_at=_utc_now(),
+                )
+            else:
+                detail["status"] = p_status
+                detail["exit_code"] = p_exit_code
+                detail["completed_at"] = _utc_now()
+                output_error = _scanner_output_error(scanner, stdout, output_path)
+                if detail.get("status") == "completed" and output_error:
+                    detail.update(
+                        status="failed",
+                        error=output_error,
+                        failure_stage="result_validation",
+                    )
+                else:
+                    detail["error"] = p_error
+
+            detail["stdout"] = decode_output(stdout) if isinstance(stdout, bytes) else str(stdout or "")
+            detail["stderr"] = decode_output(stderr) if isinstance(stderr, bytes) else str(stderr or "")
+            if output_path.exists():
+                detail["output"] = output_path.read_text(encoding="utf-8", errors="replace")
+            else:
+                detail["output"] = detail["stdout"]
+
             if detail.get("status") == "completed":
                 detail["failure_stage"] = None
-            elif detail.get("failure_stage") != "result_validation":
-                detail["failure_stage"] = "process_execution"
+
             detail["output_file"] = f"scan-results/{scan_id}/{output_path.name}"
             detail["stdout_file"] = f"scan-results/{scan_id}/{stdout_path.name}"
             detail["stderr_file"] = f"scan-results/{scan_id}/{stderr_path.name}"
+            scan_job_manager.complete_tool(
+                scan_id, scanner,
+                exit_code=detail.get("exit_code"),
+                status=detail["status"],
+                error_message=detail.get("error"),
+            )
         except Exception as exc:
             error_message = str(exc) or repr(exc) or type(exc).__name__
             detail.update({"status": "failed", "completed_at": _utc_now(), "error": error_message})
             detail["failure_stage"] = "command_construction" if "command" not in detail else "process_execution"
-            if not output_path.exists():
-                output_path.write_text("", encoding="utf-8")
-            if not stderr_path.exists():
-                stderr_path.write_bytes(b"")
+            scan_job_manager.complete_tool(scan_id, scanner, exit_code=None, status="failed", error_message=error_message)
+
         detail["duration"] = round(time.perf_counter() - execution_started, 3)
         detail["execution_seconds"] = detail["duration"]
         await update_scanner(scanner, detail)
@@ -731,8 +860,105 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
                 except Exception:
                     status_data["scanners"][scanner] = "failed"
 
-    await asyncio.gather(*(run_bounded(name) for name in SCANNERS), return_exceptions=True)
-    wappalyzer_result = await _run_wappalyzer(normalized_target)
+    wappalyzer_result: Dict[str, Any] = {
+        "tool": "Technology Fingerprinting",
+        "type": "technology_detection",
+        "target": normalized_target,
+        "status": "queued",
+        "technologies": [],
+        "technology_count": 0,
+    }
+
+    async def run_wappalyzer_tool() -> None:
+        nonlocal wappalyzer_result
+        if scan_job_manager.is_cancelled(scan_id):
+            detail = status_data["scanner_details"]["wappalyzer"]
+            detail.update({
+                "status": "cancelled",
+                "completed_at": _utc_now(),
+                "error": "Scan was cancelled by user",
+                "failure_stage": "cancelled",
+            })
+            await update_scanner("wappalyzer", detail)
+            return
+
+        detail = status_data["scanner_details"]["wappalyzer"]
+        detail.update({
+            "scanner": "wappalyzer",
+            "status": "running",
+            "target": normalized_target,
+            "started_at": _utc_now(),
+            "output_file": f"scan-results/{scan_id}/wappalyzer.json",
+            "stdout_file": f"scan-results/{scan_id}/wappalyzer.txt",
+            "stderr_file": f"scan-results/{scan_id}/wappalyzer.stderr.txt",
+        })
+        scan_job_manager.start_tool(scan_id, "wappalyzer")
+        await update_scanner("wappalyzer", detail)
+
+        w_started = time.perf_counter()
+        try:
+            wappalyzer_result = await _run_wappalyzer(normalized_target, scan_id=scan_id)
+            detail["completed_at"] = _utc_now()
+            detail["duration"] = round(time.perf_counter() - w_started, 3)
+            detail["execution_seconds"] = detail["duration"]
+            w_status = wappalyzer_result.get("status", "completed")
+            detail["status"] = w_status
+            detail["error"] = wappalyzer_result.get("error")
+            techs = wappalyzer_result.get("technologies", [])
+            summary_lines = [f"- {t.get('name')} (v{t.get('version', '')}) [{t.get('category', 'Technology')}]" for t in techs]
+            detail["stdout"] = "\n".join(summary_lines) if summary_lines else "No web technologies fingerprinted for this target."
+            detail["output"] = detail["stdout"]
+            if detail["error"]:
+                detail["stderr"] = str(detail["error"])
+            await update_scanner("wappalyzer", detail)
+            scan_job_manager.complete_tool(
+                scan_id, "wappalyzer",
+                exit_code=0 if w_status == "completed" else 1,
+                status=w_status,
+                error_message=detail.get("error"),
+            )
+        except Exception as exc:
+            detail["status"] = "failed"
+            detail["completed_at"] = _utc_now()
+            detail["duration"] = round(time.perf_counter() - w_started, 3)
+            detail["execution_seconds"] = detail["duration"]
+            detail["error"] = str(exc)
+            detail["stderr"] = str(exc)
+            await update_scanner("wappalyzer", detail)
+            scan_job_manager.complete_tool(
+                scan_id, "wappalyzer",
+                exit_code=1,
+                status="failed",
+                error_message=str(exc),
+            )
+
+    await asyncio.gather(
+        *(run_bounded(name) for name in CORE_SCANNERS),
+        run_wappalyzer_tool(),
+        return_exceptions=True,
+    )
+
+    wappalyzer_json_path = output_dir / "wappalyzer.json"
+    wappalyzer_txt_path = output_dir / "wappalyzer.txt"
+    try:
+        wappalyzer_json_path.write_text(
+            json.dumps(wappalyzer_result, indent=2, default=str), encoding="utf-8"
+        )
+        tech_lines = [
+            f"Technology Detection: {wappalyzer_result.get('target', normalized_target)}",
+            f"Status: {wappalyzer_result.get('status', 'unknown')}",
+            f"Technologies Detected: {wappalyzer_result.get('technology_count', len(wappalyzer_result.get('technologies', [])))}",
+            "",
+        ]
+        for tech in wappalyzer_result.get("technologies", []):
+            ver = f" (v{tech['version']})" if tech.get("version") else ""
+            conf = f" [{tech.get('confidence', 0)}%]"
+            tech_lines.append(f"- {tech.get('name')}{ver} | {tech.get('category')}{conf} - {tech.get('evidence', '')}")
+        if wappalyzer_result.get("error"):
+            tech_lines.append(f"\nError: {wappalyzer_result['error']}")
+        wappalyzer_txt_path.write_text("\n".join(tech_lines), encoding="utf-8")
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Failed to write wappalyzer evidence files: %s", exc)
 
     normalized_findings: Dict[str, List[Dict[str, Any]]] = {
         "confirmed": [],
@@ -750,7 +976,19 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
     asset_id = str(scan.get("asset_id", ""))
     scanner_status = status_data["scanners"]
     scanner_details = status_data["scanner_details"]
-    for scanner in SCANNERS:
+
+    # If scan was cancelled by user, mark any unfinished tool as cancelled
+    if scan_job_manager.is_cancelled(scan_id):
+        for tool_name in ALL_SCANNERS:
+            if scanner_status.get(tool_name) in ("queued", "running"):
+                scanner_status[tool_name] = "cancelled"
+                scanner_details[tool_name].update({
+                    "status": "cancelled",
+                    "error": "Scan was cancelled by user",
+                    "completed_at": _utc_now(),
+                })
+
+    for scanner in CORE_SCANNERS:
         if status_data["scanners"].get(scanner) != "completed":
             continue
         raw_output = (output_dir / f"{scanner}.txt").read_text(encoding="utf-8", errors="replace")
@@ -794,6 +1032,29 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             })
             scanner_status[scanner] = "failed"
 
+    # Add detected technologies to informational findings
+    for idx, tech in enumerate(wappalyzer_result.get("technologies", []), start=1):
+        normalized_findings["informational"].append({
+            "id": f"wappalyzer-{idx}",
+            "scanner": "wappalyzer",
+            "source": f"scan-results/{scan_id}/wappalyzer.json",
+            "classification": "informational",
+            "title": f"Technology Detected: {tech.get('name')}",
+            "category": tech.get("category", "Technology Detection"),
+            "severity": "info",
+            "confidence": float(tech.get("confidence", 100)) / 100.0,
+            "verification_status": "confirmed",
+            "evidence": {
+                "name": tech.get("name"),
+                "version": tech.get("version"),
+                "category": tech.get("category"),
+                "evidence": tech.get("evidence"),
+            },
+            "target_url": normalized_target,
+            "description": f"Detected {tech.get('name')} {tech.get('version') or ''} ({tech.get('category')})",
+            "created_at": datetime.now(timezone.utc),
+        })
+
     for scanner, scanner_state in scanner_status.items():
         if scanner_state != "completed":
             detail = scanner_details[scanner]
@@ -805,24 +1066,55 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
                 "verification_status": "unverified",
                 "status": scanner_state,
                 "exit_code": detail.get("exit_code"),
-                "message": detail.get("error") or f"{scanner} did not complete successfully",
+                "message": detail.get("error") or f"{scanner} did not complete successfully ({scanner_state})",
                 "raw_output_file": detail.get("output_file"),
                 "stderr_file": detail.get("stderr_file"),
             })
 
-    overall_status = aggregate_scanner_status(scanner_status)
+    tool_summaries = {}
+    for tool in ALL_SCANNERS:
+        st = scanner_status.get(tool, "unknown")
+        dt = scanner_details.get(tool, {})
+        tool_findings_count = sum(
+            1 for group in ("confirmed", "potential", "informational")
+            for f in normalized_findings.get(group, [])
+            if f.get("scanner") == tool
+        )
+        if st == "completed":
+            msg = f"{tool_findings_count} finding(s) detected by this tool." if tool_findings_count > 0 else "No findings detected by this tool."
+        elif st == "cancelled":
+            msg = "Scan was cancelled by the user."
+        elif st == "failed":
+            msg = f"FAILED (exit code {dt.get('exit_code')}): {dt.get('error') or 'Process failed'}"
+        else:
+            msg = f"INCOMPLETE ({st}): {dt.get('error') or 'Tool did not complete'}"
+        tool_summaries[tool] = {
+            "tool_name": tool,
+            "status": st,
+            "exit_code": dt.get("exit_code"),
+            "duration": dt.get("duration", 0.0),
+            "findings_count": tool_findings_count,
+            "summary_message": msg,
+        }
+
+    if scan_job_manager.is_cancelled(scan_id):
+        overall_status = "cancelled"
+    else:
+        overall_status = aggregate_scanner_status(scanner_status)
+
     status_data["status"] = overall_status
     status_data["completed_at"] = _utc_now()
     combined_results = {
-    "scan_id": scan_id,
-    "target": normalized_target,
-    "status": overall_status,
-    "runtime_status": runtime_status,
-    "technology_detection": wappalyzer_result,
-    **normalized_findings,
-    "scanner_status": dict(scanner_status),
-    "scanner_details": dict(scanner_details),
-}
+        "scan_id": scan_id,
+        "target": normalized_target,
+        "status": overall_status,
+        "runtime_status": runtime_status,
+        "technology_detection": wappalyzer_result,
+        "tool_summaries": tool_summaries,
+        **normalized_findings,
+        "scanner_status": dict(scanner_status),
+        "scanner_details": dict(scanner_details),
+    }
     unified_results_path = output_dir / "unified-results.json"
     unified_results_tmp = unified_results_path.with_suffix(".json.tmp")
     unified_results_tmp.write_text(
@@ -854,17 +1146,45 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
     )
     evidence_files = {
         scanner: f"scan-results/{scan_id}/{scanner}.txt"
-        for scanner in SCANNERS
+        for scanner in ALL_SCANNERS
     }
     evidence_files["unified_results"] = f"scan-results/{scan_id}/unified-results.json"
+    evidence_files["wappalyzer"] = f"scan-results/{scan_id}/wappalyzer.json"
+
+    if all_findings and hasattr(db, "vulnerabilities"):
+        try:
+            if hasattr(db.vulnerabilities, "delete_many"):
+                await db.vulnerabilities.delete_many({"scan_id": scan_id})
+            vuln_docs = []
+            for f in all_findings:
+                doc = copy.deepcopy(f)
+                doc.setdefault("scan_id", scan_id)
+                doc.setdefault("asset_id", asset_id)
+                doc.setdefault("owner_id", owner_id)
+                doc.setdefault("target_url", normalized_target)
+                doc.setdefault("status", "open")
+                doc.setdefault("created_at", datetime.now(timezone.utc))
+                vuln_docs.append(doc)
+            await db.vulnerabilities.insert_many(vuln_docs)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Failed to insert findings into vulnerabilities collection: %s", exc)
+
+    # Persist all scanner jobs to database
+    for tool_name in ALL_SCANNERS:
+        await _persist_scanner_job(db, scan_id, tool_name, scanner_details.get(tool_name, {}))
+
+    scan_duration = round(time.perf_counter() - overall_started, 3)
     await db.scans.update_one(
         {"_id": ObjectId(scan_id)},
         {"$set": {
             "status": overall_status,
-            "progress": 100,
+            "progress": 100 if overall_status != "running" else 0,
             "ended_at": datetime.now(timezone.utc),
+            "completed_at": datetime.now(timezone.utc),
+            "duration": scan_duration,
             "scanner_status": dict(scanner_status),
             "scanner_details": dict(scanner_details),
+            "tool_summaries": tool_summaries,
             "evidence_files": evidence_files,
             "combined_results": combined_results,
             "results": all_findings,

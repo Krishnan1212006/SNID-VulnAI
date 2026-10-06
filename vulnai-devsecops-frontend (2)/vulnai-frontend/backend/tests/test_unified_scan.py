@@ -213,7 +213,7 @@ def test_runtime_matrix_routes_nikto_through_wsl_on_windows(monkeypatch, tmp_pat
 
     commands = asyncio.run(build_all())
     nikto_command = commands["nikto"][0]
-    assert nikto_command[:5] == ["wsl.exe", "-d", "Ubuntu", "--", "timeout"]
+    assert nikto_command[:5] == ["wsl.exe", "-d", "Ubuntu", "--", "nikto"]
     assert "http://172.30.32.1:5173/" in nikto_command
     assert "nikto" in nikto_command
     assert "-output" in nikto_command

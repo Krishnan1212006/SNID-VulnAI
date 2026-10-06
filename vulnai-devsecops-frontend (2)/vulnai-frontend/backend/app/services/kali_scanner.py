@@ -21,6 +21,8 @@ from app.core.ids import ObjectId
 from app.core.config import settings
 from app.services.scanner import validate_url_for_ssrf, SSRFProtectionError
 from app.services.risk_scoring import compute_scan_risk
+from app.services.scanner_runtime import ScannerRuntime, decode_output
+from app.parsers.wapiti_parser import _classify_type
 from app.parsers import (
     parse_nmap,
     parse_nikto,
@@ -53,40 +55,101 @@ def validate_wapiti_target(url: str) -> str:
 def normalize_wapiti_findings(payload: Any, scan_id: str, target: str, owner_id: str, asset_id: str) -> List[Dict[str, Any]]:
     """Normalize Wapiti JSON output into VulnAI finding documents."""
     findings: List[Dict[str, Any]] = []
-    if payload is None:
+    if not payload:
         return findings
 
+    raw_items: List[tuple[str, Dict[str, Any]]] = []
+
     if isinstance(payload, list):
-        items = payload
+        for entry in payload:
+            if isinstance(entry, dict):
+                raw_items.append((str(entry.get("category") or entry.get("name") or "Web Application Security"), entry))
     elif isinstance(payload, dict):
-        items = payload.get("vulnerabilities") or payload.get("issues") or payload.get("findings") or []
-    else:
-        items = []
+        # 1. Wapiti 3.x dict in 'vulnerabilities'
+        vulns_obj = payload.get("vulnerabilities")
+        if isinstance(vulns_obj, dict):
+            for cat, items_list in vulns_obj.items():
+                if isinstance(items_list, list):
+                    for item in items_list:
+                        if isinstance(item, dict):
+                            raw_items.append((cat, item))
+        elif isinstance(vulns_obj, list):
+            for item in vulns_obj:
+                if isinstance(item, dict):
+                    raw_items.append((str(item.get("category") or "Web Application Security"), item))
 
-    if isinstance(items, dict):
-        items = [items]
+        # 2. Wapiti 3.x dict in 'anomalies'
+        anomalies_obj = payload.get("anomalies")
+        if isinstance(anomalies_obj, dict):
+            for cat, items_list in anomalies_obj.items():
+                if isinstance(items_list, list):
+                    for item in items_list:
+                        if isinstance(item, dict):
+                            raw_items.append((cat, item))
 
-    for item in items:
-        if not isinstance(item, dict):
-            continue
+        # 3. Flat 'issues' or 'findings' lists
+        for alt_key in ("issues", "findings"):
+            alt_list = payload.get(alt_key)
+            if isinstance(alt_list, list):
+                for item in alt_list:
+                    if isinstance(item, dict):
+                        raw_items.append((str(item.get("category") or "Web Application Security"), item))
 
-        level = str(item.get("level") or item.get("severity") or item.get("risk") or "info").lower()
-        title = str(item.get("name") or item.get("title") or "Potential Wapiti finding")
-        description = str(item.get("description") or item.get("details") or title)
-        url = str(item.get("url") or item.get("target_url") or target)
-        parameter = str(item.get("parameter") or item.get("param") or "N/A")
+    severity_map = {
+        "critical": "critical",
+        "high": "high",
+        "medium": "medium",
+        "moderate": "medium",
+        "low": "low",
+        "info": "info",
+        "informational": "info",
+    }
+    level_num_map = {
+        0: "info",
+        1: "low",
+        2: "medium",
+        3: "high",
+        4: "critical",
+    }
+
+    for cat_name, item in raw_items:
+        raw_level = item.get("level")
+        raw_sev = item.get("severity") or item.get("risk")
+        if isinstance(raw_level, int) and raw_level in level_num_map:
+            severity = level_num_map[raw_level]
+        elif isinstance(raw_sev, str):
+            severity = severity_map.get(raw_sev.lower().strip(), "medium")
+        elif isinstance(raw_level, str):
+            severity = severity_map.get(raw_level.lower().strip(), "medium")
+        else:
+            meta_default = _classify_type(cat_name)
+            severity = meta_default["severity"]
+
+        info = str(item.get("info") or "").strip()
+        name = str(item.get("name") or item.get("title") or "").strip()
+        param = item.get("parameter") or item.get("param")
+        parameter = str(param) if param else "N/A"
+
+        path = item.get("path")
+        item_url = item.get("url") or item.get("target_url")
+        if not item_url and path:
+            item_url = f"{target.rstrip('/')}{path if path.startswith('/') else '/' + path}"
+        url = str(item_url or target)
+
         module = str(item.get("module") or item.get("source") or "wapiti")
 
-        severity_map = {
-            "critical": "critical",
-            "high": "high",
-            "medium": "medium",
-            "moderate": "medium",
-            "low": "low",
-            "info": "info",
-            "informational": "info",
-        }
-        severity = severity_map.get(level, "medium")
+        if cat_name and cat_name != "Web Application Security":
+            if parameter != "N/A":
+                title = f"{cat_name} via '{parameter}'"
+            elif info and info.lower() != cat_name.lower():
+                title = f"{cat_name}: {info[:60]}"
+            else:
+                title = cat_name
+        else:
+            title = name or info or "Potential Wapiti finding"
+
+        desc = info or item.get("description") or item.get("details") or title
+        meta = _classify_type(cat_name or title)
 
         findings.append({
             "scan_id": scan_id,
@@ -97,20 +160,24 @@ def normalize_wapiti_findings(payload: Any, scan_id: str, target: str, owner_id:
             "severity": severity,
             "confidence": "potential",
             "source": "wapiti",
-            "category": "Web Application Security",
-            "owasp_id": "A05:2021",
-            "cwe_id": "CWE-200",
-            "description": description,
+            "category": meta["category"],
+            "owasp_id": meta["owasp"],
+            "cwe_id": meta["cwe"],
+            "description": desc,
             "evidence": {
                 "module": module,
+                "category": cat_name,
                 "parameter": parameter,
+                "method": item.get("method"),
+                "curl_command": item.get("curl_command"),
+                "wstg": item.get("wstg") or [],
                 "raw": item,
             },
             "ai_analysis": {
                 "priority": severity,
-                "problem": description,
-                "impact": "Potential web application weakness may expose application data or enable user impact.",
-                "recommendation": "Review the vulnerability through the reported endpoint and fix the underlying validation or output-handling issue.",
+                "problem": desc,
+                "impact": meta["impact"],
+                "recommendation": f"Validate and sanitize input for {parameter}. Implement appropriate security controls, input validation, or framework-level protection.",
                 "verification_steps": [
                     f"Inspect the reported endpoint: {url}",
                     f"Validate the parameter '{parameter}' in a controlled test environment.",
@@ -180,9 +247,18 @@ async def run_wapiti_scan(scan_id: str, db):
         await _fail_scan(db, scan_id, f"SSRF Protection blocked target: {str(exc)}")
         return
 
+    runtime = ScannerRuntime()
     wapiti_path = shutil.which("wapiti") or shutil.which("wapiti3")
+    uses_wsl = False
+
+    if not wapiti_path and runtime.uses_wsl:
+        check = await runtime.capture_runtime(["command", "-v", "wapiti"])
+        if check.status == "completed" and check.stdout.strip():
+            wapiti_path = "wapiti"
+            uses_wsl = True
+
     if not wapiti_path:
-        await _fail_scan(db, scan_id, "Wapiti is not installed. Install wapiti3 in the backend environment.")
+        await _fail_scan(db, scan_id, "Wapiti is not installed. Install wapiti or wapiti3 in the backend or WSL environment.")
         return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -194,6 +270,7 @@ async def run_wapiti_scan(scan_id: str, db):
         "[*] Starting direct Wapiti scan...",
         f"[*] Target: {validated_url}",
         f"[*] Output file: {output_file}",
+        f"[*] Runtime: {'WSL (' + runtime.distribution + ')' if uses_wsl else 'Host'}",
     ]
 
     await db.scans.update_one(
@@ -202,14 +279,31 @@ async def run_wapiti_scan(scan_id: str, db):
     )
 
     try:
+        if uses_wsl:
+            wsl_path_res = await runtime.capture_runtime(["wslpath", "-a", str(output_file.resolve())])
+            target_output = decode_output(wsl_path_res.stdout) if wsl_path_res.status == "completed" else str(output_file)
+            cmd = runtime.wrap_runtime_command([
+                wapiti_path,
+                "-u",
+                validated_url,
+                "-f",
+                "json",
+                "-o",
+                target_output,
+            ])
+        else:
+            cmd = [
+                wapiti_path,
+                "-u",
+                validated_url,
+                "-f",
+                "json",
+                "-o",
+                str(output_file),
+            ]
+
         proc = await asyncio.create_subprocess_exec(
-            wapiti_path,
-            "-u",
-            validated_url,
-            "-f",
-            "json",
-            "-o",
-            str(output_file),
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )

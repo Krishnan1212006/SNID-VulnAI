@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     frontend_origins: str = "http://localhost:5173"
 
     scan_timeout_seconds: int = 15
+    scan_job_timeout_seconds: int = 1800
     max_redirects: int = 5
     scanner_wsl_distribution: str = "Ubuntu"
     nikto_docker_image: str = "sullo/nikto:latest"
@@ -29,6 +30,7 @@ class Settings(BaseSettings):
     scan_output_dir: str = str(SCAN_RESULTS_ROOT)
     kali_wordlist: str = str(WORDLIST_PATH)
     kali_enabled: bool = True
+    wappalyzer_path: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=(APP_ROOT / ".env", APP_ROOT.parent / ".env"),

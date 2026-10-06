@@ -34,6 +34,10 @@ class ScanResponse(BaseModel):
     report_html_path: Optional[str] = None
     report_md_path: Optional[str] = None
 
+    completed_at: Optional[datetime] = None
+    duration: Optional[float] = None
+    tool_summaries: Optional[Dict[str, Any]] = {}
+
     model_config = ConfigDict(extra='ignore')
 
 class ScanResultResponse(BaseModel):
@@ -41,3 +45,12 @@ class ScanResultResponse(BaseModel):
     status: str
     results: List[Dict[str, Any]] = []
     issues_found: int = 0
+    confirmed: Optional[List[Dict[str, Any]]] = []
+    potential: Optional[List[Dict[str, Any]]] = []
+    informational: Optional[List[Dict[str, Any]]] = []
+    incomplete: Optional[List[Dict[str, Any]]] = []
+    unverified: Optional[List[Dict[str, Any]]] = []
+    technology_detection: Optional[Dict[str, Any]] = None
+    tool_summaries: Optional[Dict[str, Any]] = {}
+
+    model_config = ConfigDict(extra='ignore')

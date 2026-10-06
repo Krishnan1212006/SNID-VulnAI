@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 from datetime import datetime
@@ -88,6 +89,10 @@ def _compile_filter(query: dict[str, Any] | None) -> tuple[str, list[Any]]:
                     clauses.append(f"{expression} {sql_operator} %s::jsonb")
                     params.extend(path_params)
                     params.append(_jsonb(value))
+            elif operator == "$regex":
+                clauses.append(f"{expression} #>> '{{}}' ~* %s")
+                params.extend(path_params)
+                params.append(str(value))
             else:
                 raise ValueError(f"Unsupported document filter operator: {operator}")
 
@@ -158,6 +163,15 @@ class PostgresCollection:
         self.name = name
         self.pool = pool
 
+    def _execute_with_retry(self, fn, max_attempts: int = 2):
+        from psycopg import OperationalError
+        for attempt in range(max_attempts):
+            try:
+                return fn()
+            except OperationalError:
+                if attempt == max_attempts - 1:
+                    raise
+
     @staticmethod
     def _project(document: dict[str, Any], projection: dict[str, int] | None) -> dict[str, Any]:
         if not projection:
@@ -173,27 +187,34 @@ class PostgresCollection:
     async def insert_one(self, document: dict[str, Any]) -> SimpleNamespace:
         stored = dict(document)
         identifier = str(stored.setdefault("_id", ObjectId()))
-        async with self.pool.connection() as connection:
-            await connection.execute(
-                f"INSERT INTO {_TABLE} (collection, id, data) VALUES (%s, %s, %s)",
-                (self.name, identifier, _jsonb(stored)),
-            )
+        def insert() -> None:
+            with self.pool.connection() as connection:
+                connection.execute(
+                    f"INSERT INTO {_TABLE} (collection, id, data) VALUES (%s, %s, %s)",
+                    (self.name, identifier, _jsonb(stored)),
+                )
+
+        await asyncio.to_thread(self._execute_with_retry, insert)
         document["_id"] = ObjectId(identifier)
         return SimpleNamespace(inserted_id=ObjectId(identifier))
 
     async def insert_many(self, documents: list[dict[str, Any]]) -> SimpleNamespace:
         inserted_ids = []
-        async with self.pool.connection() as connection:
-            async with connection.transaction():
-                for document in documents:
-                    stored = dict(document)
-                    identifier = str(stored.setdefault("_id", ObjectId()))
-                    await connection.execute(
-                        f"INSERT INTO {_TABLE} (collection, id, data) VALUES (%s, %s, %s)",
-                        (self.name, identifier, _jsonb(stored)),
-                    )
-                    document["_id"] = ObjectId(identifier)
-                    inserted_ids.append(ObjectId(identifier))
+
+        def insert() -> None:
+            with self.pool.connection() as connection:
+                with connection.transaction():
+                    for document in documents:
+                        stored = dict(document)
+                        identifier = str(stored.setdefault("_id", ObjectId()))
+                        connection.execute(
+                            f"INSERT INTO {_TABLE} (collection, id, data) VALUES (%s, %s, %s)",
+                            (self.name, identifier, _jsonb(stored)),
+                        )
+                        document["_id"] = ObjectId(identifier)
+                        inserted_ids.append(ObjectId(identifier))
+
+        await asyncio.to_thread(self._execute_with_retry, insert)
         return SimpleNamespace(inserted_ids=inserted_ids)
 
     def find(self, query=None, projection=None) -> PostgresCursor:
@@ -223,71 +244,103 @@ class PostgresCollection:
         if skip:
             sql += " OFFSET %s"
             args.append(max(0, skip))
-        async with self.pool.connection() as connection:
-            cursor = await connection.execute(sql, args)
-            return [_decode_document(row["data"]) for row in await cursor.fetchall()]
+
+        def fetch() -> list[dict[str, Any]]:
+            with self.pool.connection() as connection:
+                cursor = connection.execute(sql, args)
+                return [_decode_document(row["data"]) for row in cursor.fetchall()]
+
+        return await asyncio.to_thread(self._execute_with_retry, fetch)
 
     async def count_documents(self, query=None) -> int:
         where, params = _compile_filter(query)
-        async with self.pool.connection() as connection:
-            cursor = await connection.execute(
-                f"SELECT COUNT(*) AS count FROM {_TABLE} WHERE collection = %s AND ({where})",
-                [self.name, *params],
-            )
-            return (await cursor.fetchone())["count"]
 
-    async def update_one(self, query, update) -> SimpleNamespace:
-        where, params = _compile_filter(query)
-        async with self.pool.connection() as connection:
-            async with connection.transaction():
-                cursor = await connection.execute(
-                    f"SELECT id, data FROM {_TABLE} WHERE collection = %s AND ({where}) LIMIT 1 FOR UPDATE",
+        def count() -> int:
+            with self.pool.connection() as connection:
+                cursor = connection.execute(
+                    f"SELECT COUNT(*) AS count FROM {_TABLE} WHERE collection = %s AND ({where})",
                     [self.name, *params],
                 )
-                row = await cursor.fetchone()
-                if row is None:
-                    return SimpleNamespace(matched_count=0, modified_count=0)
-                original = _decode_document(row["data"])
-                document = copy.deepcopy(original)
-                changes = update.get("$set", update if not any(key.startswith("$") for key in update) else {})
-                for field, value in changes.items():
-                    _set_path(document, field, value)
-                for field, amount in update.get("$inc", {}).items():
-                    _set_path(document, field, document.get(field, 0) + amount)
-                for field, value in update.get("$push", {}).items():
-                    values = document.setdefault(field, [])
-                    if isinstance(value, dict) and "$each" in value:
-                        values.extend(value["$each"])
-                    else:
-                        values.append(value)
-                for field in update.get("$unset", {}):
-                    _unset_path(document, field)
-                changed = document != original
-                if changed:
-                    await connection.execute(
-                        f"UPDATE {_TABLE} SET data = %s WHERE collection = %s AND id = %s",
-                        (_jsonb(document), self.name, row["id"]),
+                return cursor.fetchone()["count"]
+
+        return await asyncio.to_thread(self._execute_with_retry, count)
+
+    async def update_one(self, query, update, upsert: bool = False) -> SimpleNamespace:
+        where, params = _compile_filter(query)
+
+        def update_document() -> SimpleNamespace:
+            with self.pool.connection() as connection:
+                with connection.transaction():
+                    cursor = connection.execute(
+                        f"SELECT id, data FROM {_TABLE} WHERE collection = %s AND ({where}) LIMIT 1 FOR UPDATE",
+                        [self.name, *params],
                     )
-                return SimpleNamespace(matched_count=1, modified_count=int(changed))
+                    row = cursor.fetchone()
+                    if row is None:
+                        if not upsert:
+                            return SimpleNamespace(matched_count=0, modified_count=0)
+                        document = copy.deepcopy(query) if isinstance(query, dict) else {}
+                        document = {k: v for k, v in document.items() if not str(k).startswith("$") and not isinstance(v, dict)}
+                        changes = update.get("$set", update if not any(key.startswith("$") for key in update) else {})
+                        for field, value in changes.items():
+                            _set_path(document, field, value)
+                        identifier = str(document.setdefault("_id", ObjectId()))
+                        connection.execute(
+                            f"INSERT INTO {_TABLE} (collection, id, data) VALUES (%s, %s, %s)",
+                            (self.name, identifier, _jsonb(document)),
+                        )
+                        return SimpleNamespace(matched_count=0, modified_count=1, upserted_id=ObjectId(identifier))
+                    original = _decode_document(row["data"])
+                    document = copy.deepcopy(original)
+                    changes = update.get("$set", update if not any(key.startswith("$") for key in update) else {})
+                    for field, value in changes.items():
+                        _set_path(document, field, value)
+                    for field, amount in update.get("$inc", {}).items():
+                        _set_path(document, field, document.get(field, 0) + amount)
+                    for field, value in update.get("$push", {}).items():
+                        values = document.setdefault(field, [])
+                        if isinstance(value, dict) and "$each" in value:
+                            values.extend(value["$each"])
+                        else:
+                            values.append(value)
+                    for field in update.get("$unset", {}):
+                        _unset_path(document, field)
+                    changed = document != original
+                    if changed:
+                        connection.execute(
+                            f"UPDATE {_TABLE} SET data = %s WHERE collection = %s AND id = %s",
+                            (_jsonb(document), self.name, row["id"]),
+                        )
+                    return SimpleNamespace(matched_count=1, modified_count=int(changed))
+
+        return await asyncio.to_thread(self._execute_with_retry, update_document)
 
     async def delete_one(self, query) -> SimpleNamespace:
         where, params = _compile_filter(query)
-        async with self.pool.connection() as connection:
-            cursor = await connection.execute(
-                f"WITH target AS (SELECT id FROM {_TABLE} WHERE collection = %s AND ({where}) LIMIT 1) "
-                f"DELETE FROM {_TABLE} d USING target t WHERE d.collection = %s AND d.id = t.id",
-                [self.name, *params, self.name],
-            )
-            return SimpleNamespace(deleted_count=cursor.rowcount)
+
+        def delete() -> SimpleNamespace:
+            with self.pool.connection() as connection:
+                cursor = connection.execute(
+                    f"WITH target AS (SELECT id FROM {_TABLE} WHERE collection = %s AND ({where}) LIMIT 1) "
+                    f"DELETE FROM {_TABLE} d USING target t WHERE d.collection = %s AND d.id = t.id",
+                    [self.name, *params, self.name],
+                )
+                return SimpleNamespace(deleted_count=cursor.rowcount)
+
+        return await asyncio.to_thread(self._execute_with_retry, delete)
 
     async def delete_many(self, query=None) -> SimpleNamespace:
         where, params = _compile_filter(query)
-        async with self.pool.connection() as connection:
-            cursor = await connection.execute(
-                f"DELETE FROM {_TABLE} WHERE collection = %s AND ({where})",
-                [self.name, *params],
-            )
-            return SimpleNamespace(deleted_count=cursor.rowcount)
+
+        def delete() -> SimpleNamespace:
+            with self.pool.connection() as connection:
+                cursor = connection.execute(
+                    f"DELETE FROM {_TABLE} WHERE collection = %s AND ({where})",
+                    [self.name, *params],
+                )
+                return SimpleNamespace(deleted_count=cursor.rowcount)
+
+        return await asyncio.to_thread(self._execute_with_retry, delete)
 
     async def aggregate(self, pipeline) -> PostgresCursor:
         match = next((stage["$match"] for stage in pipeline if "$match" in stage), {})
@@ -296,14 +349,64 @@ class PostgresCollection:
             raise ValueError("Only field grouping is supported by the Postgres document store")
         expression, path_params = _field_sql(group["_id"][1:])
         where, params = _compile_filter(match)
-        async with self.pool.connection() as connection:
-            cursor = await connection.execute(
-                f"SELECT {expression} AS _id, COUNT(*) AS count FROM {_TABLE} "
-                f"WHERE collection = %s AND ({where}) GROUP BY {expression}",
-                [*path_params, self.name, *params, *path_params],
-            )
-            records = [{"_id": row["_id"], "count": row["count"]} for row in await cursor.fetchall()]
-        return PostgresCursor(self, records=records)
+
+        def aggregate() -> list[dict[str, Any]]:
+            with self.pool.connection() as connection:
+                cursor = connection.execute(
+                    f"SELECT {expression} AS _id, COUNT(*) AS count FROM {_TABLE} "
+                    f"WHERE collection = %s AND ({where}) GROUP BY {expression}",
+                    [*path_params, self.name, *params, *path_params],
+                )
+                return [{"_id": row["_id"], "count": row["count"]} for row in cursor.fetchall()]
+
+        return PostgresCursor(self, records=await asyncio.to_thread(aggregate))
+
+
+    async def delete_one(self, query) -> SimpleNamespace:
+        where, params = _compile_filter(query)
+
+        def delete() -> SimpleNamespace:
+            with self.pool.connection() as connection:
+                cursor = connection.execute(
+                    f"WITH target AS (SELECT id FROM {_TABLE} WHERE collection = %s AND ({where}) LIMIT 1) "
+                    f"DELETE FROM {_TABLE} d USING target t WHERE d.collection = %s AND d.id = t.id",
+                    [self.name, *params, self.name],
+                )
+                return SimpleNamespace(deleted_count=cursor.rowcount)
+
+        return await asyncio.to_thread(delete)
+
+    async def delete_many(self, query=None) -> SimpleNamespace:
+        where, params = _compile_filter(query)
+
+        def delete() -> SimpleNamespace:
+            with self.pool.connection() as connection:
+                cursor = connection.execute(
+                    f"DELETE FROM {_TABLE} WHERE collection = %s AND ({where})",
+                    [self.name, *params],
+                )
+                return SimpleNamespace(deleted_count=cursor.rowcount)
+
+        return await asyncio.to_thread(delete)
+
+    async def aggregate(self, pipeline) -> PostgresCursor:
+        match = next((stage["$match"] for stage in pipeline if "$match" in stage), {})
+        group = next((stage["$group"] for stage in pipeline if "$group" in stage), None)
+        if not group or not isinstance(group.get("_id"), str) or not group["_id"].startswith("$"):
+            raise ValueError("Only field grouping is supported by the Postgres document store")
+        expression, path_params = _field_sql(group["_id"][1:])
+        where, params = _compile_filter(match)
+
+        def aggregate() -> list[dict[str, Any]]:
+            with self.pool.connection() as connection:
+                cursor = connection.execute(
+                    f"SELECT {expression} AS _id, COUNT(*) AS count FROM {_TABLE} "
+                    f"WHERE collection = %s AND ({where}) GROUP BY 1",
+                    [*path_params, self.name, *params],
+                )
+                return [{"_id": _decode_document(row["_id"]) if isinstance(row["_id"], dict) else row["_id"], "count": row["count"]} for row in cursor.fetchall()]
+
+        return PostgresCursor(self, records=await asyncio.to_thread(self._execute_with_retry, aggregate))
 
 
 class PostgresDatabase:
@@ -321,34 +424,41 @@ async def connect_to_postgres() -> None:
     if not settings.database_url:
         raise RuntimeError("DATABASE_URL must be set to your Neon Postgres connection string")
     from psycopg.rows import dict_row
-    from psycopg_pool import AsyncConnectionPool
+    from psycopg_pool import ConnectionPool
 
-    _pool = AsyncConnectionPool(
+    pool = ConnectionPool(
         conninfo=settings.database_url,
         kwargs={"row_factory": dict_row, "prepare_threshold": None},
         min_size=1,
         max_size=10,
+        max_idle=60,
+        max_lifetime=300,
+        check=ConnectionPool.check_connection,
         open=False,
     )
-    try:
-        await _pool.open()
-        async with _pool.connection() as connection:
-            await connection.execute(
+
+    def initialize() -> None:
+        pool.open(wait=True)
+        with pool.connection() as connection:
+            connection.execute(
                 f"CREATE TABLE IF NOT EXISTS {_TABLE} ("
                 "collection TEXT NOT NULL, id TEXT NOT NULL, data JSONB NOT NULL, "
                 "PRIMARY KEY (collection, id))"
             )
-            await connection.execute(
+            connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_data ON {_TABLE} USING GIN (data)"
             )
-            await connection.execute(
+            connection.execute(
                 f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{_TABLE}_user_email "
                 f"ON {_TABLE} ((data->>'email')) WHERE collection = 'users'"
             )
+
+    try:
+        await asyncio.to_thread(initialize)
     except Exception:
-        await _pool.close()
-        _pool = None
+        await asyncio.to_thread(pool.close)
         raise
+    _pool = pool
     _database = PostgresDatabase(_pool)
     print("Connected to Neon Postgres")
 
@@ -356,7 +466,7 @@ async def connect_to_postgres() -> None:
 async def close_postgres_connection() -> None:
     global _pool, _database
     if _pool is not None:
-        await _pool.close()
+        await asyncio.to_thread(_pool.close)
         _pool = None
         _database = None
         print("Neon Postgres connection closed")

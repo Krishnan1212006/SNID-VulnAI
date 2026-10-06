@@ -1,9 +1,11 @@
+import copy
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import List
 import os
 from app.core.ids import ObjectId
+from app.services.scan_job_manager import scan_job_manager
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from app.database import get_database
@@ -187,6 +189,8 @@ async def get_scans(current_user: dict = Depends(get_current_user)):
     formatted_scans = []
     for s in scans:
         s["id"] = str(s["_id"])
+        if s.get("duration") is None:
+            s["duration"] = _compute_scan_duration(s)
         formatted_scans.append(s)
     return formatted_scans
 
@@ -211,6 +215,41 @@ async def get_scan_trends(current_user: dict = Depends(get_current_user)):
     return trendData
 
 
+def _compute_scan_duration(scan: dict, live_job=None) -> float:
+    if live_job and live_job.status in ("queued", "running"):
+        return round(live_job.elapsed_seconds(), 1)
+    if scan.get("duration") is not None:
+        try:
+            return round(float(scan.get("duration")), 2)
+        except (ValueError, TypeError):
+            pass
+    if live_job and live_job.duration > 0:
+        return round(live_job.duration, 2)
+    started_at = scan.get("started_at")
+    if started_at:
+        if isinstance(started_at, str):
+            try:
+                started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            except Exception:
+                started_at = None
+        if started_at:
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            ended_at = scan.get("completed_at") or scan.get("ended_at")
+            if ended_at:
+                if isinstance(ended_at, str):
+                    try:
+                        ended_at = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                    except Exception:
+                        ended_at = datetime.now(timezone.utc)
+                if ended_at.tzinfo is None:
+                    ended_at = ended_at.replace(tzinfo=timezone.utc)
+                return round((ended_at - started_at).total_seconds(), 2)
+            else:
+                return round((datetime.now(timezone.utc) - started_at).total_seconds(), 1)
+    return 0.0
+
+
 @router.get("/{scan_id}/assessment-status")
 async def get_assessment_status(scan_id: str, current_user: dict = Depends(get_current_user)):
     db = get_database()
@@ -225,18 +264,125 @@ async def get_assessment_status(scan_id: str, current_user: dict = Depends(get_c
     if not scan.get("unified_mode"):
         raise HTTPException(status_code=400, detail="Scan is not a unified assessment")
 
+    live_job = scan_job_manager.get_scan(scan_id)
+    scanners = dict(scan.get("scanner_status", {}))
+    scanner_details = copy.deepcopy(scan.get("scanner_details", {}))
+
+    if live_job:
+        for tool_name, tool_job in live_job.tools.items():
+            if tool_name not in scanners or scanners[tool_name] in ("queued", "running"):
+                scanners[tool_name] = tool_job.status
+            if tool_name not in scanner_details:
+                scanner_details[tool_name] = {"scanner": tool_name, "status": tool_job.status}
+            dt = scanner_details[tool_name]
+            dt["status"] = tool_job.status
+            if tool_job.status == "running":
+                dt["duration"] = round(tool_job.elapsed_seconds(), 1)
+                dt["execution_seconds"] = dt["duration"]
+            elif tool_job.duration > 0:
+                dt["duration"] = round(tool_job.duration, 2)
+            if tool_job.stdout:
+                dt["stdout"] = tool_job.stdout
+                dt["output"] = tool_job.stdout
+            if tool_job.stderr:
+                dt["stderr"] = tool_job.stderr
+            if tool_job.exit_code is not None:
+                dt["exit_code"] = tool_job.exit_code
+            if tool_job.error_message:
+                dt["error"] = tool_job.error_message
+
+    duration_value = _compute_scan_duration(scan, live_job)
+
     return {
         "scan_id": scan_id,
         "target": scan.get("target_url"),
         "status": scan.get("status", "unknown"),
         "progress": scan.get("progress", 0),
-        "scanners": scan.get("scanner_status", {}),
-        "scanner_details": scan.get("scanner_details", {}),
+        "scanners": scanners,
+        "scanner_details": scanner_details,
         "runtime_status": scan.get("runtime_status"),
         "started_at": scan.get("started_at"),
         "ended_at": scan.get("ended_at"),
+        "completed_at": scan.get("completed_at"),
+        "duration": duration_value,
         "error_message": scan.get("error_message"),
+        "tool_summaries": scan.get("tool_summaries") or scan.get("combined_results", {}).get("tool_summaries", {}),
     }
+
+
+@router.get("/{scan_id}/tools")
+async def get_scan_tools(scan_id: str, current_user: dict = Depends(get_current_user)):
+    """Return individual live and persisted scanner execution states for all 6 tools."""
+    db = get_database()
+    try:
+        obj_id = ObjectId(scan_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid scan ID")
+
+    scan = await db.scans.find_one({"_id": obj_id, "owner_id": str(current_user["_id"])})
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    live_job = scan_job_manager.get_scan(scan_id)
+    persisted_jobs = []
+    if hasattr(db, "scanner_jobs"):
+        try:
+            persisted_jobs = await db.scanner_jobs.find({"scan_id": scan_id}).to_list(length=20)
+        except Exception:
+            persisted_jobs = []
+
+    persisted_map = {j.get("tool_name"): j for j in persisted_jobs}
+    scanner_details = scan.get("scanner_details", {})
+    scanner_status = scan.get("scanner_status", {})
+    combined_results = scan.get("combined_results") or {}
+    tool_summaries = combined_results.get("tool_summaries") or scan.get("tool_summaries") or {}
+
+    ALL_TOOLS = ("nmap", "nikto", "wapiti", "sqlmap", "gobuster", "wappalyzer")
+    tools_list = []
+    for tool_name in ALL_TOOLS:
+        detail = scanner_details.get(tool_name, {})
+        pj = persisted_map.get(tool_name, {})
+        live_tool = live_job.tools.get(tool_name) if live_job else None
+
+        status = (live_tool.status if live_tool else None) or pj.get("status") or detail.get("status") or scanner_status.get(tool_name) or "queued"
+
+        if live_tool and live_tool.status == "running":
+            duration = live_tool.elapsed_seconds()
+        else:
+            duration = (live_tool.duration if live_tool else None) or pj.get("duration") or detail.get("duration") or detail.get("execution_seconds") or 0.0
+
+        stdout = (live_tool.stdout if live_tool else None) or pj.get("stdout") or detail.get("stdout") or detail.get("output") or ""
+        stderr = (live_tool.stderr if live_tool else None) or pj.get("stderr") or detail.get("stderr") or ""
+
+        exit_code = (live_tool.exit_code if live_tool else None) if (live_tool and live_tool.exit_code is not None) else pj.get("exit_code") if pj.get("exit_code") is not None else detail.get("exit_code")
+        error_message = (live_tool.error_message if live_tool else None) or pj.get("error_message") or detail.get("error")
+
+        def fmt_time(val):
+            if val is None:
+                return None
+            if hasattr(val, "isoformat"):
+                return val.isoformat()
+            return str(val)
+
+        summary = tool_summaries.get(tool_name, {})
+
+        tools_list.append({
+            "id": f"{scan_id}_{tool_name}",
+            "scan_id": scan_id,
+            "tool_name": tool_name,
+            "status": status,
+            "started_at": (fmt_time(live_tool.started_at) if live_tool else None) or pj.get("started_at") or detail.get("started_at"),
+            "completed_at": (fmt_time(live_tool.completed_at) if live_tool else None) or pj.get("completed_at") or detail.get("completed_at"),
+            "duration": round(duration, 2),
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "error_message": error_message,
+            "findings_count": summary.get("findings_count", 0),
+            "summary_message": summary.get("summary_message", ""),
+        })
+
+    return tools_list
 
 
 @router.get("/{scan_id}/assessment-results")
@@ -253,6 +399,21 @@ async def get_assessment_results(scan_id: str, current_user: dict = Depends(get_
     if not scan.get("unified_mode"):
         raise HTTPException(status_code=400, detail="Scan is not a unified assessment")
     if not scan.get("combined_results"):
+        if scan.get("status") in ("completed", "failed", "completed_with_failures", "incomplete", "cancelled"):
+            return {
+                "scan_id": scan_id,
+                "target": scan.get("target_url"),
+                "status": scan.get("status"),
+                "runtime_status": scan.get("runtime_status"),
+                "technology_detection": scan.get("technology_detection", {}),
+                "tool_summaries": scan.get("tool_summaries", {}),
+                "confirmed": [],
+                "potential": [],
+                "informational": [],
+                "incomplete": [],
+                "scanner_status": scan.get("scanner_status", {}),
+                "scanner_details": scan.get("scanner_details", {}),
+            }
         raise HTTPException(status_code=409, detail="Unified assessment results are not ready")
     return scan["combined_results"]
 
@@ -269,11 +430,13 @@ async def get_scan_status(scan_id: str, current_user: dict = Depends(get_current
         raise HTTPException(status_code=404, detail="Scan not found")
         
     s["id"] = str(s["_id"])
+    if s.get("duration") is None:
+        live_job = scan_job_manager.get_scan(scan_id)
+        s["duration"] = _compute_scan_duration(s, live_job)
     return s
 
 @router.get("/{scan_id}/progress")
 async def get_scan_progress(scan_id: str, current_user: dict = Depends(get_current_user)):
-    # Simply retrieves the progress %
     s = await get_scan_status(scan_id, current_user)
     return {
         "progress": s.get("progress", 0),
@@ -284,6 +447,7 @@ async def get_scan_progress(scan_id: str, current_user: dict = Depends(get_curre
         "target_url": s.get("target_url"),
         "kali_mode": s.get("kali_mode", False),
         "total_findings": s.get("total_findings", 0),
+        "duration": s.get("duration"),
         "error_message": s.get("error_message")
     }
 
@@ -300,11 +464,19 @@ async def get_scan_results(scan_id: str, current_user: dict = Depends(get_curren
         raise HTTPException(status_code=404, detail="Scan not found")
         
     results = s.get("results", [])
+    combined = s.get("combined_results") or {}
     return {
         "scan_id": scan_id,
         "status": s.get("status", "unknown"),
         "results": results,
-        "issues_found": len(results)
+        "issues_found": len(results),
+        "confirmed": combined.get("confirmed", []),
+        "potential": combined.get("potential", []),
+        "informational": combined.get("informational", []),
+        "incomplete": combined.get("incomplete", []),
+        "unverified": combined.get("unverified", []),
+        "technology_detection": combined.get("technology_detection"),
+        "tool_summaries": combined.get("tool_summaries") or s.get("tool_summaries", {}),
     }
 
 @router.get("/{scan_id}/compare/{previous_id}")
@@ -386,15 +558,46 @@ async def cancel_scan(scan_id: str, current_user: dict = Depends(get_current_use
         
     if s["status"] in ["completed", "failed"]:
         raise HTTPException(status_code=400, detail=f"Cannot cancel scan in {s['status']} state")
-        
+
+    # Safely terminate child processes across process tree
+    scan_job_manager.cancel_scan(scan_id)
+
+    now = datetime.now(timezone.utc)
+    scanner_status = dict(s.get("scanner_status", {}))
+    scanner_details = dict(s.get("scanner_details", {}))
+    for tool_name, state in list(scanner_status.items()):
+        if state in ("queued", "running"):
+            scanner_status[tool_name] = "cancelled"
+            if tool_name in scanner_details:
+                scanner_details[tool_name]["status"] = "cancelled"
+                scanner_details[tool_name]["completed_at"] = now.isoformat()
+                scanner_details[tool_name]["error"] = "Scan was cancelled by the user"
+
     await db.scans.update_one(
         {"_id": obj_id},
-        {"$set": {"status": "cancelled", "ended_at": datetime.now(timezone.utc)}}
+        {"$set": {
+            "status": "cancelled",
+            "ended_at": now,
+            "completed_at": now,
+            "scanner_status": scanner_status,
+            "scanner_details": scanner_details,
+        }}
     )
+
+    if hasattr(db, "scanner_jobs"):
+        try:
+            for tool_name in scanner_status:
+                if scanner_status[tool_name] == "cancelled":
+                    await db.scanner_jobs.update_one(
+                        {"scan_id": scan_id, "tool_name": tool_name},
+                        {"$set": {"status": "cancelled", "completed_at": now.isoformat(), "error_message": "Scan was cancelled by the user"}},
+                    )
+        except Exception:
+            pass
     
     await log_audit_action(current_user["_id"], "Scan Cancelled", {"scan_id": scan_id})
     
-    return {"message": "Scan cancelled"}
+    return {"message": "Scan cancelled", "scan_id": scan_id, "status": "cancelled"}
 
 @router.get("/{scan_id}/terminal")
 async def get_scan_terminal(scan_id: str, current_user: dict = Depends(get_current_user)):
@@ -452,10 +655,16 @@ async def get_scan_evidence(scan_id: str, current_user: dict = Depends(get_curre
     evidence_files = s.get("evidence_files", {})
     evidence_data = {}
     for tool_name, file_path in evidence_files.items():
-        if os.path.exists(file_path):
+        candidate_paths = [
+            Path(file_path),
+            SCAN_RESULTS_ROOT.parent / file_path,
+            SCAN_RESULTS_ROOT / file_path,
+            SCAN_RESULTS_ROOT / scan_id / Path(file_path).name,
+        ]
+        resolved = next((p for p in candidate_paths if p.is_file()), None)
+        if resolved:
             try:
-                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    evidence_data[tool_name] = f.read()
+                evidence_data[tool_name] = resolved.read_text(encoding="utf-8", errors="replace")
             except Exception as e:
                 evidence_data[tool_name] = f"Error reading file: {str(e)}"
         else:

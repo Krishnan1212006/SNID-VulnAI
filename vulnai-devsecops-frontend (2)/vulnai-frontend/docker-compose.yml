@@ -6,7 +6,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=${DATABASE_URL:-}
+      - DATABASE_URL=${postgresql://neondb_owner:npg_azfh5kdDR6tV@ep-soft-wind-b49tnxma-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require}
       - SECRET_KEY=vulnai_super_secret_for_docker
       - KALI_SCRIPT_PATH=/app/scripts/kali_scanner.sh
       - SCAN_OUTPUT_DIR=/app/scan-results
