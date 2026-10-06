@@ -1,86 +1,190 @@
-from typing import List, Dict, Any
+"""
+VulnAI Project Risk Scoring Engine.
 
-class RiskScore:
-    def __init__(self, findings: List[Dict[str, Any]], asset_criticality: float = 1.0, is_public: bool = True):
+Transparent, project-defined risk assessment model.
+Does not claim to be CVSS or an industry-standard score.
+Clearly labeled as 'VulnAI Project Risk Score'.
+
+Never awards 100/100 simply because there are zero CONFIRMED vulnerabilities
+if POTENTIAL findings exist.
+"""
+
+from typing import List, Dict, Any, Optional
+
+# Configurable deduction weights
+RISK_WEIGHTS = {
+    # Confirmed vulnerabilities (validated evidence)
+    "confirmed": {
+        "critical": 25.0,
+        "high": 18.0,
+        "medium": 10.0,
+        "low": 4.0,
+        "info": 0.0,
+    },
+    # Potential findings (unverified scanner observations)
+    "potential": {
+        "critical": 12.0,
+        "high": 8.0,
+        "medium": 4.0,
+        "low": 1.5,
+        "info": 0.0,
+    },
+    # Informational observations
+    "informational": {
+        "critical": 0.0,
+        "high": 0.0,
+        "medium": 0.0,
+        "low": 0.0,
+        "info": 0.0,
+    },
+    # Incomplete scanner jobs (uncertainty penalty)
+    "incomplete": {
+        "penalty_per_incomplete": 3.0,
+    }
+}
+
+
+class ProjectRiskScoreEngine:
+    def __init__(
+        self,
+        findings: List[Dict[str, Any]],
+        scanner_status: Optional[Dict[str, str]] = None,
+        is_public: bool = True,
+    ):
         self.findings = findings
-        self.asset_criticality = asset_criticality
+        self.scanner_status = scanner_status or {}
         self.is_public = is_public
-        
-    def calculate_score(self) -> Dict[str, Any]:
+
+    def calculate(self) -> Dict[str, Any]:
         """
-        Explainable Risk Scoring Engine
-        Base score is 100.
-        finding_risk = severity_weight * confidence * exposure_factor * asset_criticality_factor
-        Weights:
-        - Critical: 10
-        - High: 7
-        - Medium: 4
-        - Low: 1
+        Calculates the transparent VulnAI Project Risk Score.
+        Base Score: 100.
         """
-        weights = {
-            "critical": 10,
-            "high": 7,
-            "medium": 4,
-            "low": 1,
-            "info": 0
-        }
-        
-        exposure_factor = 1.2 if self.is_public else 0.8
-        
-        total_deductions = 0
-        explanations = []
-        
+        # If all scanners failed or no scanners ran, score cannot be determined
+        terminal_states = list(self.scanner_status.values())
+        if terminal_states and all(s in ("failed", "unavailable") for s in terminal_states):
+            return {
+                "score": None,
+                "score_display": "Not Fully Determined",
+                "rating": "UNDETERMINED",
+                "model_name": "VulnAI Project Risk Score (Project-Defined)",
+                "base_score": 100,
+                "total_deductions": 0,
+                "explanation": ["All security scanners failed or were unavailable. Evidence is insufficient to calculate a risk score."],
+                "is_indeterminate": True,
+            }
+
+        base_score = 100.0
+        total_deductions = 0.0
+        deduction_items = []
+
+        confirmed_count = 0
+        potential_count = 0
+        info_count = 0
+
         for f in self.findings:
-            sev = f.get("severity", "info").lower()
-            conf_val = f.get("confidence", 1.0)
-            if isinstance(conf_val, str):
-                conf_map = {
-                    "confirmed": 1.0,
-                    "potential": 0.75,
-                    "informational": 0.3,
-                    "incomplete": 0.2
-                }
-                confidence = conf_map.get(conf_val.lower(), 0.75)
+            title = f.get("title", "Unknown Observation")
+            sev = str(f.get("severity", "info")).lower()
+            raw_verif = f.get("verification_status")
+            if raw_verif:
+                verif = str(raw_verif).lower()
             else:
-                try:
-                    confidence = float(conf_val)
-                except (ValueError, TypeError):
-                    confidence = 1.0
-            weight = weights.get(sev, 0)
-            finding_risk = weight * confidence * exposure_factor * self.asset_criticality
-            
-            if finding_risk > 0:
-                total_deductions += finding_risk
-                explanations.append({
-                    "finding": f.get("title", "Unknown Finding"),
-                    "deduction": round(finding_risk, 2),
-                    "reason": f"Severity {sev} (wt: {weight}) x Conf {confidence} x Exp Fact {exposure_factor} x Crit {self.asset_criticality}"
+                conf = f.get("confidence")
+                if conf in (1.0, "1.0", "confirmed"):
+                    verif = "confirmed"
+                elif sev == "info" or conf in ("informational",):
+                    verif = "informational"
+                else:
+                    verif = "potential"
+
+            if verif == "confirmed":
+                confirmed_count += 1
+                deduction = RISK_WEIGHTS["confirmed"].get(sev, 0.0)
+            elif verif == "informational" or sev == "info":
+                info_count += 1
+                deduction = RISK_WEIGHTS["informational"].get(sev, 0.0)
+            else:
+                potential_count += 1
+                deduction = RISK_WEIGHTS["potential"].get(sev, 0.0)
+
+            if deduction > 0:
+                total_deductions += deduction
+                deduction_items.append({
+                    "finding": title,
+                    "verification": verif.upper(),
+                    "verification_status": verif.upper(),
+                    "severity": sev.upper(),
+                    "deduction": round(deduction, 1),
+                    "reason": f"{verif.capitalize()} {sev.capitalize()} observation (-{round(deduction, 1)} pts)"
                 })
-                
-        # Deduct active incident risk (stub for now, suppose 0)
-        incident_risk = 0
-        
-        final_score = 100 - total_deductions - incident_risk
-        
-        final_score = max(0, min(100, final_score))
-        final_score = round(final_score)
-        
-        if final_score >= 80:
+
+        # Check for incomplete / timed out scanner jobs
+        incomplete_scanners = [
+            scanner for scanner, st in self.scanner_status.items()
+            if st in ("timed_out", "incomplete", "cancelled")
+        ]
+        if incomplete_scanners:
+            penalty = len(incomplete_scanners) * RISK_WEIGHTS["incomplete"]["penalty_per_incomplete"]
+            total_deductions += penalty
+            deduction_items.append({
+                "finding": f"Incomplete Assessment ({', '.join(incomplete_scanners)})",
+                "verification": "INCOMPLETE",
+                "verification_status": "INCOMPLETE",
+                "severity": "UNCERTAINTY",
+                "deduction": round(penalty, 1),
+                "reason": f"{len(incomplete_scanners)} scanner(s) did not finish cleanly; uncertainty deduction applied"
+            })
+
+        final_score = max(0, min(100, round(base_score - total_deductions)))
+
+        if final_score >= 85:
             rating = "Low"
-        elif final_score >= 60:
+        elif final_score >= 65:
             rating = "Medium"
-        elif final_score >= 40:
+        elif final_score >= 45:
             rating = "High"
         else:
             rating = "Critical"
-            
+
         return {
             "score": final_score,
+            "score_display": f"{final_score} / 100",
             "rating": rating,
-            "deductions": round(total_deductions, 2),
-            "explanation": explanations
+            "model": "VulnAI Project Risk Score (Project-Defined)",
+            "model_name": "VulnAI Project Risk Score (Project-Defined)",
+            "base_score": 100,
+            "total_deductions": round(total_deductions, 1),
+            "deductions": deduction_items,
+            "explanation": deduction_items,
+            "counts": {
+                "confirmed": confirmed_count,
+                "potential": potential_count,
+                "informational": info_count,
+                "incomplete": len(incomplete_scanners),
+            },
+            "is_indeterminate": False,
         }
 
-def compute_scan_risk(scan_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    engine = RiskScore(scan_results)
-    return engine.calculate_score()
+
+def compute_scan_risk(
+    findings: List[Dict[str, Any]],
+    scanner_status: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    engine = ProjectRiskScoreEngine(findings, scanner_status=scanner_status)
+    return engine.calculate()
+
+
+class RiskScore:
+    """Compatibility wrapper for tests and legacy callers."""
+    def __init__(self, findings: List[Dict[str, Any]], active_incidents: int = 0):
+        self.findings = findings
+        self.active_incidents = active_incidents
+
+    def calculate_score(self) -> Dict[str, Any]:
+        engine = ProjectRiskScoreEngine(self.findings)
+        res = engine.calculate()
+        compat_res = dict(res)
+        # Ensure 'deductions' is numeric for test assertion: assert res['deductions'] > 0.0
+        compat_res["deductions"] = res.get("total_deductions", 0.0)
+        return compat_res
+

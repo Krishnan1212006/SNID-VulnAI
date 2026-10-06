@@ -16,11 +16,19 @@ from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
+import copy
 import httpx
 from app.core.ids import ObjectId
 
-from app.parsers import parse_nmap, parse_nikto, parse_sqlmap, parse_wapiti
+from app.parsers import (
+    parse_nmap, extract_nmap_host_discovery,
+    parse_nikto,
+    parse_sqlmap, extract_sqlmap_assessment,
+    parse_wapiti,
+)
 from app.parsers.gobuster_parser import parse_gobuster_observations
+from app.services.finding_correlation import correlate_and_deduplicate_findings
+from app.services.assessment_coverage import get_assessment_coverage, get_owasp_coverage_matrix
 from app.core.paths import SCAN_RESULTS_ROOT, WORDLIST_PATH
 from app.services.risk_scoring import compute_scan_risk
 from app.services.scanner import SSRFProtectionError, validate_url_for_ssrf
@@ -475,70 +483,181 @@ def _write_markdown_report(
     categorized_results: Dict[str, List[Dict[str, Any]]],
     overall_status: str,
     technology_detection: Optional[Dict[str, Any]] = None,
+    combined_results: Optional[Dict[str, Any]] = None,
 ) -> Path:
     report_path = output_dir / "security_assessment_report.md"
+    comb = combined_results or {}
+    risk_score = comb.get("risk_score", {})
+    score_val = risk_score.get("score")
+    score_disp = f"{score_val}/100" if score_val is not None else "Not Fully Determined"
+    rating_disp = risk_score.get("rating", "Undetermined")
+
+    c_findings = categorized_results.get("confirmed", [])
+    p_findings = categorized_results.get("potential", [])
+    i_findings = categorized_results.get("informational", [])
+    inc_findings = categorized_results.get("incomplete", [])
+
     lines = [
-        "# Unified Security Assessment",
+        "# VulnAI DevSecOps - Security Assessment Report",
         "",
-        f"- Scan ID: `{scan_id}`",
-        f"- Target: `{target}`",
-        f"- Status: `{overall_status}`",
+        "> **Notice:** Automated security assessment report. Scanner output represents indicators that must be manually validated before being treated as confirmed vulnerabilities. Scanner completion does not denote that the target is completely secure.",
         "",
-        "## Scanner Status",
+        "## 1. Executive Summary",
         "",
-        "| Scanner | Status | Exit code | Evidence |",
-        "|---|---|---:|---|",
+        f"- **Target Host / URL:** `{target}`",
+        f"- **Scan ID:** `{scan_id}`",
+        f"- **Assessment Status:** `{overall_status.upper()}`",
+        f"- **VulnAI Project Risk Score:** `{score_disp}` (Risk Rating: **{rating_disp}**)",
+        f"- **Model:** {risk_score.get('model', 'VulnAI Project Risk Score (Project-Defined)')}",
+        "",
+        "### Finding Verification Classification",
+        "",
+        "| Category | Count | Definition |",
+        "|---|---:|---|",
+        f"| **Confirmed Vulnerabilities** | **{len(c_findings)}** | Evidence is sufficiently validated |",
+        f"| **Potential Security Findings** | **{len(p_findings)}** | Security indicator detected; requires independent confirmation |",
+        f"| **Informational Observations** | **{len(i_findings)}** | Reconnaissance / technology / configuration data |",
+        f"| **Incomplete / Timed Out** | **{len(inc_findings)}** | Tool did not complete sufficiently |",
+        "",
     ]
+
+    # SQL Injection Summary
+    sql_assessment = comb.get("sql_assessment", {})
+    if sql_assessment.get("injection_confirmed"):
+        lines.append("- **SQL Injection Assessment:** **CONFIRMED SQL Injection Identified**")
+    else:
+        lines.append("- **SQL Injection Assessment:** No confirmed SQL injection identified.")
+    lines.append("")
+
+    # Score breakdown
+    lines.extend([
+        "## 2. VulnAI Project Risk Score Calculation",
+        "",
+        "| Factor / Finding | Verification | Severity | Deduction |",
+        "|---|---|---|---:|",
+        "| Starting Base Score | Standard | Baseline | 100 pts |",
+    ])
+    for d in (risk_score.get("deductions") or []):
+        lines.append(f"| {d.get('finding')} | {d.get('verification_status')} | {str(d.get('severity')).upper()} | -{d.get('deduction', 0)} pts |")
+    lines.append(f"| **Final VulnAI Risk Score** | — | **{rating_disp}** | **{score_disp}** |")
+    lines.append("")
+
+    # Scanner Status
+    lines.extend([
+        "## 3. Scanner Execution Summary",
+        "",
+        "| Scanner | Status | Runtime | Findings | Verification State |",
+        "|---|---|---:|---:|---|",
+    ])
     for scanner in ALL_SCANNERS:
         detail = scanner_details.get(scanner, {})
-        evidence_file = f"scan-results/{scan_id}/wappalyzer.json" if scanner == "wappalyzer" else f"scan-results/{scan_id}/{scanner}.txt"
-        lines.append(
-            f"| {scanner} | {scanner_status.get(scanner, 'unknown')} | {detail.get('exit_code')} | `{evidence_file}` |"
+        st = scanner_status.get(scanner, "unknown")
+        dur = detail.get("duration") or detail.get("execution_seconds") or 0.0
+        findings_count = sum(
+            1 for group in ("confirmed", "potential", "informational")
+            for f in categorized_results.get(group, [])
+            if scanner.lower() in [s.lower() for s in f.get("detected_by", [f.get("scanner", "")])]
         )
-        # Technology Detection
-    if technology_detection:
+        lines.append(f"| {scanner.capitalize()} | {st.upper()} | {dur:.2f}s | {findings_count} | {'Completed' if st == 'completed' else 'Incomplete/Failed'} |")
+    lines.append("")
+    lines.append("> *Notice: 'COMPLETED' indicates the automated subprocess finished executing. It does NOT denote that the target is secure.*")
+    lines.append("")
+
+    # Host Discovery
+    host_disc = comb.get("host_discovery", {})
+    lines.extend([
+        "## 4. Host Information & Port Discovery (Nmap)",
+        "",
+        f"- **Hostname:** `{host_disc.get('hostname', target)}`",
+        f"- **Resolved IP:** `{host_disc.get('resolved_ip', 'Not Resolved')}`",
+        f"- **Host State:** `{host_disc.get('host_state', 'UP')}`",
+        "",
+        "| Port / Protocol | State | Service | Product | Version |",
+        "|---|---|---|---|---|",
+    ])
+    open_ports = host_disc.get("open_ports", [])
+    if open_ports:
+        for p in open_ports:
+            lines.append(f"| {p.get('port')}/{p.get('protocol', 'tcp')} | {p.get('state')} | {p.get('service')} | {p.get('product') or '—'} | {p.get('version') or '—'} |")
+    else:
+        lines.append("| Target web port assessed | OPEN | HTTP/HTTPS | — | — |")
+    lines.append("")
+
+    # Technology Detection
+    techs = (technology_detection or {}).get("technologies", [])
+    lines.extend([
+        "## 5. Technology Stack (Wappalyzer)",
+        "",
+        "> *Classification: INFORMATIONAL. Technology identification maps attack surface; not automatically a vulnerability.*",
+        "",
+        "| Technology | Category | Version | Confidence |",
+        "|---|---|---|---:|",
+    ])
+    if techs:
+        for t in techs:
+            lines.append(f"| {t.get('name')} | {t.get('category')} | {t.get('version') or '—'} | {t.get('confidence', 100)}% |")
+    else:
+        lines.append("| No distinctive technologies detected | — | — | — |")
+    lines.append("")
+
+    # Assessment Coverage
+    coverage_list = comb.get("assessment_coverage", [])
+    if coverage_list:
         lines.extend([
+            "## 6. Assessment Coverage & Boundaries",
             "",
-            "## Technology Detection",
-            "",
-            f"- Status: `{technology_detection.get('status', 'unknown')}`",
-            f"- Technologies detected: `{technology_detection.get('technology_count', 0)}`",
-            "",
-            "| Technology | Category | Confidence |",
-            "|---|---|---:|",
+            "| Assessment Area | Tool | Status | Methodology Note |",
+            "|---|---|---|---|",
         ])
+        for cov in coverage_list:
+            lines.append(f"| {cov.get('area')} | {cov.get('tool')} | **{cov.get('status')}** | {cov.get('note')} |")
+        lines.append("")
 
-        technologies = technology_detection.get("technologies", [])
+    # OWASP Coverage Matrix
+    owasp_matrix = comb.get("owasp_coverage", [])
+    if owasp_matrix:
+        lines.extend([
+            "## 7. OWASP Top 10 (2021) Coverage Matrix",
+            "",
+            "> *Important Disclaimer: OWASP Top 10 coverage represents automated assessment coverage and does not constitute certification or proof of security.*",
+            "",
+            "| Category | Assessment Status | Findings | Scope Note |",
+            "|---|---|---:|---|",
+        ])
+        for ow in owasp_matrix:
+            lines.append(f"| {ow.get('id')} {ow.get('name')} | **{ow.get('status')}** | {ow.get('findings_count', 0)} | {ow.get('notes')} |")
+        lines.append("")
 
-        if technologies:
-            for technology in technologies:
-                lines.append(
-                    f"| {technology.get('name', 'Unknown')} | "
-                    f"{technology.get('category', 'Unknown')} | "
-                    f"{technology.get('confidence', 0)}% |"
-                )
-        else:
-            lines.append("| None detected | — | — |")
-
-    for classification in ("confirmed", "potential", "informational", "incomplete"):
-        findings = categorized_results[classification]
-        lines.extend(["", f"## {classification.title()} ({len(findings)})", ""])
-        if not findings:
-            lines.append("None.")
-            continue
-        for finding in findings:
-            scanner = finding.get("scanner", "unknown")
-            title = finding.get("title") or finding.get("path") or finding.get("message") or "Scanner observation"
-            lines.append(f"- **{scanner}: {title}**")
-            if finding.get("target_url"):
-                lines.append(f"  - Target: `{finding['target_url']}`")
-            if finding.get("status_code") is not None:
-                lines.append(f"  - HTTP {finding['status_code']}; {finding.get('response_size', 'unknown')} bytes")
-            lines.append(f"  - Verification: `{finding.get('verification_status', 'unverified')}`")
-            raw_output = finding.get("raw_line") or finding.get("description") or finding.get("message")
-            if raw_output:
-                lines.append(f"  - Evidence: `{finding.get('evidence', {}).get('raw_output_file', finding.get('raw_output_file', 'scanner output'))}`")
-                lines.append(f"  - Observation: {str(raw_output).replace(chr(10), ' ')[:500]}")
+    # Detailed Findings
+    detailed_findings = [*c_findings, *p_findings]
+    lines.extend([
+        "## 8. Correlated Security Findings",
+        "",
+    ])
+    if not detailed_findings:
+        lines.append("No confirmed or potential security vulnerabilities were identified within the automated assessment scope.")
+        lines.append("")
+    else:
+        for idx, f in enumerate(detailed_findings, start=1):
+            f_id = f.get("id") or f"VULNAI-{idx:03d}"
+            det_by = ", ".join(f.get("detected_by", [])) if isinstance(f.get("detected_by"), list) else str(f.get("detected_by") or f.get("scanner", ""))
+            lines.extend([
+                f"### {f_id}: {f.get('title')}",
+                "",
+                f"- **Severity:** `{str(f.get('severity', 'info')).upper()}`",
+                f"- **Verification Status:** `{str(f.get('verification_status', 'POTENTIAL')).upper()}`",
+                f"- **Confidence:** `{f.get('confidence', 'MEDIUM')}`",
+                f"- **Detected By:** `{det_by}`",
+                f"- **Affected Endpoint:** `{f.get('endpoint') or f.get('target_url') or target}`",
+                f"- **OWASP Category:** {f.get('owasp_category') or f.get('owasp_id') or 'Not mapped'}",
+                f"- **CWE:** {f.get('cwe') or f.get('cwe_id') or 'Not mapped'}",
+                f"- **WSTG:** {f.get('wstg', 'Not mapped')}",
+                f"- **Description:** {f.get('description', '')}",
+                f"- **Security Impact:** {f.get('impact', '')}",
+                f"- **Remediation:** {f.get('recommendation', '')}",
+                f"- **Raw Evidence Artifact:** `{f.get('raw_evidence_files', ['scan-results/'])[0] if isinstance(f.get('raw_evidence_files'), list) and f.get('raw_evidence_files') else f.get('evidence', {}).get('raw_output_file', 'scan-results/')}`",
+                "",
+            ])
 
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report_path
@@ -988,40 +1107,44 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
                     "completed_at": _utc_now(),
                 })
 
+    raw_findings_by_scanner: Dict[str, List[Dict[str, Any]]] = {
+        "nmap": [],
+        "nikto": [],
+        "wapiti": [],
+        "sqlmap": [],
+        "gobuster": [],
+    }
+    host_discovery_data: Dict[str, Any] = {
+        "hostname": normalized_target,
+        "resolved_ip": "Not Resolved",
+        "host_state": "UP",
+        "latency": "",
+        "open_ports": []
+    }
+    sqlmap_assessment_data: Dict[str, Any] = {
+        "status": "SQLMap did not run",
+        "injection_confirmed": False,
+        "summary": "Assessment not performed."
+    }
+
     for scanner in CORE_SCANNERS:
         if status_data["scanners"].get(scanner) != "completed":
             continue
-        raw_output = (output_dir / f"{scanner}.txt").read_text(encoding="utf-8", errors="replace")
+        scanner_file = output_dir / f"{scanner}.txt"
+        raw_output = scanner_file.read_text(encoding="utf-8", errors="replace") if scanner_file.is_file() else ""
         try:
-            if scanner == "gobuster":
-                parsed_findings = parse_gobuster_observations(raw_output)
-                for index, finding in enumerate(parsed_findings, start=1):
-                    finding["evidence"] = {"raw_line": finding.get("raw_line", ""), "raw_output_file": f"scan-results/{scan_id}/gobuster.txt"}
-                    finding["scan_id"] = scan_id
-                    finding["asset_id"] = asset_id
-                    finding["owner_id"] = owner_id
-                    finding["target_url"] = normalized_target
-                    finding["id"] = f"gobuster-{index}"
-                    finding["confidence"] = 0.2
-                    finding["category"] = "Asset Discovery"
-                    finding["owasp_id"] = "N/A"
-                    finding["cwe_id"] = "N/A"
-                    finding["description"] = (
-                        f"Gobuster observed {finding['path']} (HTTP {finding['status_code']}, "
-                        f"{finding.get('response_size', 'unknown')} bytes). This is informational and unverified."
-                    )
-                    finding["ai_analysis"] = {}
-                    finding["created_at"] = datetime.now(timezone.utc)
-                    normalized_findings["informational"].append(finding)
-                continue
-
-            parser = parser_by_scanner[scanner]
-            parsed_findings = parser(raw_output, scan_id, normalized_target, owner_id, asset_id)
-            for index, finding in enumerate(parsed_findings, start=1):
-                normalized = _normalise_parser_finding(
-                    scanner, finding, index, f"scan-results/{scan_id}/{scanner}.txt"
-                )
-                normalized_findings[normalized["classification"]].append(normalized)
+            if scanner == "nmap":
+                host_discovery_data = extract_nmap_host_discovery(raw_output, normalized_target)
+                raw_findings_by_scanner["nmap"] = parse_nmap(raw_output, scan_id, normalized_target, owner_id, asset_id)
+            elif scanner == "nikto":
+                raw_findings_by_scanner["nikto"] = parse_nikto(raw_output, scan_id, normalized_target, owner_id, asset_id)
+            elif scanner == "wapiti":
+                raw_findings_by_scanner["wapiti"] = parse_wapiti(raw_output, scan_id, normalized_target, owner_id, asset_id)
+            elif scanner == "sqlmap":
+                sqlmap_assessment_data = extract_sqlmap_assessment(raw_output)
+                raw_findings_by_scanner["sqlmap"] = parse_sqlmap(raw_output, scan_id, normalized_target, owner_id, asset_id)
+            elif scanner == "gobuster":
+                raw_findings_by_scanner["gobuster"] = parse_gobuster_observations(raw_output)
         except Exception as exc:
             detail = scanner_details[scanner]
             detail.update({
@@ -1032,26 +1155,105 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             })
             scanner_status[scanner] = "failed"
 
-    # Add detected technologies to informational findings
+    # Correlate and deduplicate findings across scanners
+    correlated_findings_objs = correlate_and_deduplicate_findings(
+        raw_findings_by_scanner,
+        scan_id=scan_id,
+        target=normalized_target,
+        asset_id=asset_id,
+        owner_id=owner_id,
+    )
+    correlated_findings_dicts = [f.to_dict() for f in correlated_findings_objs]
+
+    # Split into canonical verification groups
+    normalized_findings: Dict[str, List[Dict[str, Any]]] = {
+        "confirmed": [],
+        "potential": [],
+        "informational": [],
+        "incomplete": [],
+    }
+
+    for f in correlated_findings_dicts:
+        verif = str(f.get("verification_status", "POTENTIAL")).lower()
+        if verif == "confirmed":
+            normalized_findings["confirmed"].append(f)
+        elif verif == "informational":
+            normalized_findings["informational"].append(f)
+        else:
+            normalized_findings["potential"].append(f)
+
+    # Add Gobuster path observations into informational group
+    gobuster_list = raw_findings_by_scanner.get("gobuster", [])
+    for index, finding in enumerate(gobuster_list, start=1):
+        normalized_findings["informational"].append({
+            "id": f"gobuster-{index}",
+            "scanner": "gobuster",
+            "path": finding.get("path", "/"),
+            "detected_by": ["Gobuster"],
+            "title": f"Directory Discovered: {finding.get('path', '/')}",
+            "description": f"Gobuster observed {finding.get('path')} (HTTP {finding.get('status_code')}, {finding.get('response_size', 'unknown')} bytes). Informational path discovery.",
+            "target": normalized_target,
+            "target_url": normalized_target,
+            "endpoint": finding.get("path", "/"),
+            "severity": "info",
+            "confidence": "HIGH",
+            "verification_status": "unverified",
+            "category": "Directory / Path Discovery",
+            "owasp_id": "N/A",
+            "owasp_category": "A01:2021 - Broken Access Control",
+            "cwe_id": "N/A",
+            "cwe": "Not mapped",
+            "wstg": "WSTG-INFO-04",
+            "evidence": {
+                "raw_line": finding.get("raw_line", ""),
+                "status_code": finding.get("status_code"),
+                "response_size": finding.get("response_size"),
+                "raw_output_file": f"scan-results/{scan_id}/gobuster.txt"
+            },
+            "impact": "Exposed directories and endpoints define the application attack surface.",
+            "recommendation": "Review endpoint exposure. Ensure restricted routes enforce server-side authentication.",
+            "references": ["https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/04-Enumerate_Applications_on_Webserver"],
+            "scan_id": scan_id,
+            "asset_id": asset_id,
+            "owner_id": owner_id,
+            "status": "open",
+            "created_at": datetime.now(timezone.utc),
+        })
+
+    # Add detected technologies into informational group
     for idx, tech in enumerate(wappalyzer_result.get("technologies", []), start=1):
         normalized_findings["informational"].append({
             "id": f"wappalyzer-{idx}",
-            "scanner": "wappalyzer",
+            "scanner": "Wappalyzer",
+            "detected_by": ["Wappalyzer"],
             "source": f"scan-results/{scan_id}/wappalyzer.json",
             "classification": "informational",
+            "verification_status": "INFORMATIONAL",
             "title": f"Technology Detected: {tech.get('name')}",
-            "category": tech.get("category", "Technology Detection"),
+            "category": tech.get("category", "Technology Stack"),
+            "owasp_id": "N/A",
+            "owasp_category": "A06:2021 - Vulnerable and Outdated Components",
+            "cwe_id": "N/A",
+            "cwe": "Not mapped",
+            "wstg": "WSTG-INFO-08",
             "severity": "info",
-            "confidence": float(tech.get("confidence", 100)) / 100.0,
-            "verification_status": "confirmed",
+            "confidence": "HIGH",
             "evidence": {
                 "name": tech.get("name"),
                 "version": tech.get("version"),
                 "category": tech.get("category"),
                 "evidence": tech.get("evidence"),
             },
+            "target": normalized_target,
             "target_url": normalized_target,
             "description": f"Detected {tech.get('name')} {tech.get('version') or ''} ({tech.get('category')})",
+            "impact": "Identified web stack component. Informational reconnaissance data.",
+            "recommendation": "Maintain inventory of components and keep libraries updated to latest supported releases.",
+            "references": ["https://owasp.org/www-project-top-ten/2021/A06_2021-Vulnerable_and_Outdated_Components/"],
+            "scan_id": scan_id,
+            "asset_id": asset_id,
+            "owner_id": owner_id,
+            "status": "open",
             "created_at": datetime.now(timezone.utc),
         })
 
@@ -1061,11 +1263,13 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             normalized_findings["incomplete"].append({
                 "id": f"{scanner}-incomplete",
                 "scanner": scanner,
+                "detected_by": [scanner.capitalize()],
                 "source": f"scan-results/{scan_id}/{scanner}.txt",
                 "classification": "incomplete",
-                "verification_status": "unverified",
+                "verification_status": "INCOMPLETE",
                 "status": scanner_state,
                 "exit_code": detail.get("exit_code"),
+                "title": f"Scanner Job Incomplete: {scanner.capitalize()} ({scanner_state})",
                 "message": detail.get("error") or f"{scanner} did not complete successfully ({scanner_state})",
                 "raw_output_file": detail.get("output_file"),
                 "stderr_file": detail.get("stderr_file"),
@@ -1078,7 +1282,7 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
         tool_findings_count = sum(
             1 for group in ("confirmed", "potential", "informational")
             for f in normalized_findings.get(group, [])
-            if f.get("scanner") == tool
+            if tool.lower() in [s.lower() for s in f.get("detected_by", [f.get("scanner", "")])]
         )
         if st == "completed":
             msg = f"{tool_findings_count} finding(s) detected by this tool." if tool_findings_count > 0 else "No findings detected by this tool."
@@ -1104,17 +1308,58 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
 
     status_data["status"] = overall_status
     status_data["completed_at"] = _utc_now()
+
+    confirmed_findings = normalized_findings["confirmed"]
+    potential_findings = normalized_findings["potential"]
+    informational_findings = normalized_findings["informational"]
+    incomplete_findings = normalized_findings["incomplete"]
+
+    # Calculate transparent VulnAI Project Risk Score including potential deductions
+    risk_score = compute_scan_risk(
+        [*confirmed_findings, *potential_findings],
+        scanner_status=scanner_status,
+    )
+    severity_summary = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for finding in [*confirmed_findings, *potential_findings]:
+        severity = str(finding.get("severity", "info")).lower()
+        if severity in severity_summary:
+            severity_summary[severity] += 1
+        else:
+            severity_summary["info"] += 1
+
+    assessment_coverage = get_assessment_coverage(scanner_status)
+    owasp_coverage = get_owasp_coverage_matrix(
+        [*confirmed_findings, *potential_findings],
+        scanner_status,
+    )
+
     combined_results = {
         "scan_id": scan_id,
         "target": normalized_target,
         "status": overall_status,
         "runtime_status": runtime_status,
         "technology_detection": wappalyzer_result,
+        "host_discovery": host_discovery_data,
+        "sql_assessment": sqlmap_assessment_data,
+        "assessment_coverage": assessment_coverage,
+        "owasp_coverage": owasp_coverage,
         "tool_summaries": tool_summaries,
-        **normalized_findings,
+        "confirmed": confirmed_findings,
+        "potential": potential_findings,
+        "informational": informational_findings,
+        "incomplete": incomplete_findings,
+        "correlated_findings": correlated_findings_dicts,
         "scanner_status": dict(scanner_status),
         "scanner_details": dict(scanner_details),
+        "risk_score": risk_score,
+        "counts": {
+            "confirmed": len(confirmed_findings),
+            "potential": len(potential_findings),
+            "informational": len(informational_findings),
+            "incomplete": len(incomplete_findings),
+        }
     }
+
     unified_results_path = output_dir / "unified-results.json"
     unified_results_tmp = unified_results_path.with_suffix(".json.tmp")
     unified_results_tmp.write_text(
@@ -1122,17 +1367,11 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
     )
     os.replace(unified_results_tmp, unified_results_path)
     await _write_status_file(output_dir, status_data)
-    confirmed_findings = normalized_findings["confirmed"]
-    risk_score = compute_scan_risk(confirmed_findings)
-    severity_summary = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
-    for finding in confirmed_findings:
-        severity = str(finding.get("severity", "info")).lower()
-        severity_summary[severity if severity in severity_summary else "info"] += 1
 
     all_findings = [
-        *normalized_findings["confirmed"],
-        *normalized_findings["potential"],
-        *normalized_findings["informational"],
+        *confirmed_findings,
+        *potential_findings,
+        *informational_findings,
     ]
     markdown_report = _write_markdown_report(
         output_dir,
@@ -1143,6 +1382,7 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
         normalized_findings,
         overall_status=overall_status,
         technology_detection=wappalyzer_result,
+        combined_results=combined_results,
     )
     evidence_files = {
         scanner: f"scan-results/{scan_id}/{scanner}.txt"
@@ -1151,6 +1391,7 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
     evidence_files["unified_results"] = f"scan-results/{scan_id}/unified-results.json"
     evidence_files["wappalyzer"] = f"scan-results/{scan_id}/wappalyzer.json"
 
+    # Store findings in db.vulnerabilities
     if all_findings and hasattr(db, "vulnerabilities"):
         try:
             if hasattr(db.vulnerabilities, "delete_many"):
@@ -1189,9 +1430,14 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             "combined_results": combined_results,
             "results": all_findings,
             "total_findings": len(confirmed_findings),
+            "findings_count": len(confirmed_findings) + len(potential_findings),
+            "confirmed_count": len(confirmed_findings),
+            "potential_count": len(potential_findings),
+            "informational_count": len(informational_findings),
+            "incomplete_count": len(incomplete_findings),
             "severity_summary": severity_summary,
-            "risk_score": risk_score if overall_status == "completed" else None,
-            "security_score": risk_score.get("score", 100) if overall_status == "completed" else None,
+            "risk_score": risk_score,
+            "security_score": risk_score.get("score") if (overall_status == "completed" and not risk_score.get("is_indeterminate")) else None,
             "report_md_path": str(markdown_report),
         }},
     )

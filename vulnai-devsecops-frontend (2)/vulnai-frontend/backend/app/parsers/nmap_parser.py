@@ -168,3 +168,43 @@ def parse_nmap(
         findings.append(finding)
 
     return findings
+
+
+def extract_nmap_host_discovery(raw_output: str, target: str) -> Dict[str, Any]:
+    """Extract host discovery and open ports table from raw Nmap output."""
+    info: Dict[str, Any] = {
+        "hostname": target,
+        "resolved_ip": "Not Resolved",
+        "host_state": "UP",
+        "latency": "",
+        "open_ports": []
+    }
+    if not raw_output:
+        return info
+
+    ip_match = re.search(r"Nmap scan report for .*?\((\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)", raw_output)
+    if ip_match:
+        info["resolved_ip"] = ip_match.group(1)
+    else:
+        ip_direct = re.search(r"Nmap scan report for (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", raw_output)
+        if ip_direct:
+            info["resolved_ip"] = ip_direct.group(1)
+
+    state_match = re.search(r"Host is (\w+)(?:\s*\(([^)]+)\))?", raw_output)
+    if state_match:
+        info["host_state"] = state_match.group(1).upper()
+        if state_match.group(2):
+            info["latency"] = state_match.group(2)
+
+    for match in PORT_PATTERN.finditer(raw_output):
+        port = match.group(1)
+        service = match.group(2)
+        version = match.group(3).strip()
+        info["open_ports"].append({
+            "port": f"{port}/tcp",
+            "state": "OPEN",
+            "service": service,
+            "product_version": version or "N/A"
+        })
+
+    return info

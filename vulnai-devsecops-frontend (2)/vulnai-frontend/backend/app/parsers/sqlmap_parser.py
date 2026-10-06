@@ -178,3 +178,33 @@ def parse_sqlmap(
         })
 
     return findings
+
+
+def extract_sqlmap_assessment(raw_output: str) -> Dict[str, Any]:
+    """Evaluate SQLMap assessment outcome accurately."""
+    if not raw_output or not raw_output.strip():
+        return {
+            "status": "SQLMap did not produce output",
+            "injection_confirmed": False,
+            "summary": "Assessment could not be completed."
+        }
+
+    lower = raw_output.lower()
+    if PARAM_BLOCK_PATTERN.search(raw_output):
+        return {
+            "status": "SQL Injection Confirmed",
+            "injection_confirmed": True,
+            "summary": "One or more injectable parameters were validated."
+        }
+    elif "all tested parameters do not appear to be injectable" in lower or "does not appear to be injectable" in lower:
+        return {
+            "status": "No confirmed SQL injection identified",
+            "injection_confirmed": False,
+            "summary": "SQLMap tested parameters and found no confirmed SQL injection vulnerabilities."
+        }
+    else:
+        return {
+            "status": "No confirmed SQL injection identified",
+            "injection_confirmed": False,
+            "summary": "Tested target; no active SQL injection vectors validated."
+        }
