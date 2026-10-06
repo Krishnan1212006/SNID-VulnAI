@@ -408,9 +408,9 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
 
     all_tool_names = ["nmap", "nikto", "wapiti", "sqlmap", "gobuster", "wappalyzer"]
     for t_name in all_tool_names:
-        ts = tool_summaries.get(t_name, {})
-        sd = scanner_details.get(t_name, {})
-        st = ts.get('status') or scanner_status.get(t_name, 'unknown')
+        ts = tool_summaries.get(t_name) if isinstance(tool_summaries.get(t_name), dict) else {}
+        sd = scanner_details.get(t_name) if isinstance(scanner_details.get(t_name), dict) else {}
+        st = ts.get('status') or (scanner_status.get(t_name) if isinstance(scanner_status, dict) else None) or 'unknown'
         dur = ts.get('duration') or sd.get('duration') or sd.get('execution_seconds')
         f_count = ts.get('findings_count', 0)
         
@@ -424,11 +424,13 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
         elif st == 'timed_out':
             ver_text = "Timed Out (Incomplete)"
         else:
-            ver_text = f"Failed ({sd.get('error', 'Execution Error')[:30]})"
+            raw_err = (sd.get('error') if isinstance(sd, dict) else None) or (ts.get('error') if isinstance(ts, dict) else None) or 'Execution Error'
+            err_str = str(raw_err) if raw_err else 'Execution Error'
+            ver_text = f"Failed ({err_str[:30]})"
 
         tools_table_rows.append([
             Paragraph(escape(t_name.capitalize()), table_cell_bold),
-            Paragraph(escape(st.upper()), table_cell_style),
+            Paragraph(escape(str(st).upper()), table_cell_style),
             Paragraph(escape(_format_duration(dur)), table_cell_style),
             Paragraph(str(f_count), table_cell_style),
             Paragraph(escape(ver_text), table_cell_style),
@@ -748,10 +750,15 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
             rec = finding.get('recommendation', 'Apply vendor security best practices and test in non-production.')
             
             raw_files = finding.get('raw_evidence_files', [])
-            raw_ref = ", ".join(raw_files) if raw_files else finding.get('evidence', {}).get('raw_output_file', 'scan-results/')
+            raw_ev = finding.get('evidence')
+            if raw_files:
+                raw_ref = ", ".join(raw_files)
+            elif isinstance(raw_ev, dict):
+                raw_ref = raw_ev.get('raw_output_file', 'scan-results/')
+            else:
+                raw_ref = 'scan-results/'
 
             ev_content = ""
-            raw_ev = finding.get('evidence')
             if isinstance(raw_ev, dict):
                 ev_items = [f"{k}: {v}" for k, v in raw_ev.items() if k not in ('raw_output_file',) and v]
                 ev_content = " | ".join(ev_items)[:400]
@@ -759,6 +766,9 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
                 ev_content = str(raw_ev)[:400]
             if not ev_content:
                 ev_content = desc[:300]
+
+            refs_list = finding.get('references')
+            ref_first = refs_list[0] if (isinstance(refs_list, (list, tuple)) and refs_list and refs_list[0]) else 'OWASP Guidance'
 
             finding_table_data = [
                 [
@@ -779,7 +789,7 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
                 ],
                 [
                     Paragraph(f"<b>Remediation Recommendation:</b><br/>{escape(rec)}", table_cell_style),
-                    Paragraph(f"<b>References:</b><br/>{escape(str(finding.get('references', ['OWASP Guidance'])[0]))}", table_cell_style)
+                    Paragraph(f"<b>References:</b><br/>{escape(str(ref_first))}", table_cell_style)
                 ]
             ]
 
