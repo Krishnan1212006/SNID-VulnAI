@@ -313,32 +313,47 @@ export default function ScanPage() {
           if (["completed", "completed_with_failures", "failed", "incomplete", "cancelled"].includes(status)) {
             clearInterval(timerRef.current);
             if (tickTimerRef.current) clearInterval(tickTimerRef.current);
+
+            let scanData = {
+              id: returnedScanId,
+              target_url: progRes.data.target || scanTarget || url,
+              status: status,
+              duration: progRes.data.duration,
+              scanner_status: progRes.data.scanners || progRes.data.scanner_status || {},
+              scanner_details: progRes.data.scanner_details || {},
+            };
+
             if (comprehensiveMode) {
-              const [fullScan, finalToolsRes] = await Promise.all([
-                api.get(`/scans/${returnedScanId}`),
-                api.get(`/scans/${returnedScanId}/tools`).catch(() => null),
-              ]);
-              if (finalToolsRes && Array.isArray(finalToolsRes.data)) {
-                setToolsData(finalToolsRes.data);
-              }
-              setScannerStatus(fullScan.data.scanner_status || progRes.data.scanners || {});
               try {
-                const resultsRes = await api.get(`/scans/${returnedScanId}/assessment-results`);
-                setAssessmentResults(resultsRes.data);
-                setScanResult({ ...fullScan.data, status: resultsRes.data.status || status });
-                setState(STATE.DONE);
-              } catch (resultsError) {
-                setScanResult({ ...fullScan.data, status });
+                const [fullScanRes, finalToolsRes, resultsRes] = await Promise.all([
+                  api.get(`/scans/${returnedScanId}`).catch(() => null),
+                  api.get(`/scans/${returnedScanId}/tools`).catch(() => null),
+                  api.get(`/scans/${returnedScanId}/assessment-results`).catch(() => null),
+                ]);
+
+                if (finalToolsRes?.data && Array.isArray(finalToolsRes.data)) {
+                  setToolsData(finalToolsRes.data);
+                }
+                if (fullScanRes?.data) {
+                  scanData = { ...scanData, ...fullScanRes.data };
+                }
+                if (resultsRes?.data) {
+                  setAssessmentResults(resultsRes.data);
+                  scanData.status = resultsRes.data.status || scanData.status || status;
+                }
+              } catch (fetchErr) {
+                console.warn("Failed to fetch full results, using progress data:", fetchErr);
+              } finally {
+                setScanResult(scanData);
                 setState(STATE.DONE);
               }
-            } else if (status === "completed") {
-              const fullScan = await api.get(`/scans/${returnedScanId}`);
-              setScanResult(fullScan.data);
-              setState(STATE.DONE);
-            } else if (status === "cancelled") {
-              const fullScan = await api.get(`/scans/${returnedScanId}`);
-              setScanResult({ ...fullScan.data, status: "cancelled" });
-              setState(STATE.DONE);
+            } else if (status === "completed" || status === "cancelled") {
+              try {
+                const fullScan = await api.get(`/scans/${returnedScanId}`).catch(() => null);
+                setScanResult(fullScan?.data || scanData);
+              } finally {
+                setState(STATE.DONE);
+              }
             } else {
               setState(STATE.IDLE);
               setError(progRes.data.error_message || "Scan failed to complete due to backend error.");
@@ -526,7 +541,7 @@ export default function ScanPage() {
                       : "Executing passive non-intrusive security checks..."}
                   </p>
                   <p className="mt-1 text-[11px] text-slate-500">
-                    Scan ID: <span className="text-cyan-400 font-mono">{scanId || "Initializing..."}</span> · Overall Status: <span className="text-emerald-400 font-bold uppercase">RUNNING</span>
+                    Scan ID: <span className="text-cyan-400 font-mono">{scanId || "Initializing..."}</span> · Overall Status: <span className="text-emerald-400 font-bold uppercase">{progress >= 100 ? "COMPLETING & COMPILING AUDIT..." : "RUNNING"}</span>
                   </p>
                 </div>
               </div>
