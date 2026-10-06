@@ -45,7 +45,7 @@ async def get_report_csv(scan_id: str, current_user: dict = Depends(get_current_
         
     vulns = await db.vulnerabilities.find({"scan_id": scan_id}).to_list(length=1000)
     
-    csv_buffer = generate_csv(vulns)
+    csv_buffer = generate_csv(vulns, scan)
     
     await log_audit_action(current_user["_id"], "Downloaded CSV Report", {"scan_id": scan_id})
     return StreamingResponse(

@@ -1,5 +1,5 @@
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import json
 from pathlib import Path
 from typing import List
@@ -191,6 +191,14 @@ async def get_scans(current_user: dict = Depends(get_current_user)):
         s["id"] = str(s["_id"])
         if s.get("duration") is None:
             s["duration"] = _compute_scan_duration(s)
+        if s.get("completed_at") is None:
+            if s.get("ended_at") is not None:
+                s["completed_at"] = s.get("ended_at")
+            elif s.get("duration") and s.get("started_at") and s.get("status") == "completed":
+                try:
+                    s["completed_at"] = s["started_at"] + timedelta(seconds=float(s["duration"]))
+                except Exception:
+                    pass
         formatted_scans.append(s)
     return formatted_scans
 

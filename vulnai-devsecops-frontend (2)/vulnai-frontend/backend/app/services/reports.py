@@ -1,12 +1,32 @@
 import io
 import json
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 from xml.sax.saxutils import escape
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
+
+def _format_duration(duration) -> str:
+    if duration is None:
+        return "N/A"
+    try:
+        dur_val = float(duration)
+        mins = int(dur_val // 60)
+        secs = int(dur_val % 60)
+        if mins > 0:
+            return f"{mins}m {secs}s ({round(dur_val, 1)}s)"
+        return f"{round(dur_val, 1)}s"
+    except (ValueError, TypeError):
+        return str(duration)
+
+def _format_datetime(dt) -> str:
+    if not dt:
+        return "N/A"
+    if isinstance(dt, datetime):
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    return str(dt)
 
 def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
     buffer = io.BytesIO()
@@ -20,23 +40,56 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
     
     elements = []
     
+    # Timing Metadata Preparation
+    now_utc = datetime.now(timezone.utc)
+    report_gen_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    started_str = _format_datetime(scan_data.get('started_at'))
+    completed_str = _format_datetime(scan_data.get('completed_at') or scan_data.get('ended_at'))
+    dur_str = _format_duration(scan_data.get('duration'))
+
     # Base Metadata
     elements.append(Paragraph("VulnAI DevSecOps - Security Assessment Report", title_style))
-    elements.append(Spacer(1, 12))
+    elements.append(Spacer(1, 10))
     elements.append(Paragraph("<b>Notice:</b> Automated security assessment report. Scanner output represents indicators that must be manually validated before being treated as confirmed vulnerabilities. This assessment records observed evidence and does not claim or certify that the target is completely secure.", normal_style))
     elements.append(Spacer(1, 12))
     
     target_display = scan_data.get('target_url') or (scan_data.get('target_urls', ['Unknown'])[0] if scan_data.get('target_urls') else 'Unknown')
     elements.append(Paragraph(f"<b>Target URL:</b> {target_display}", normal_style))
     elements.append(Paragraph(f"<b>Scan ID:</b> {scan_data.get('_id')}", normal_style))
-    started = scan_data.get('started_at')
-    date_str = started.strftime("%Y-%m-%d %H:%M:%S UTC") if isinstance(started, datetime) else str(started)
-    elements.append(Paragraph(f"<b>Scan Date:</b> {date_str}", normal_style))
+    elements.append(Paragraph(f"<b>Report Generated At:</b> {report_gen_str}", normal_style))
+    elements.append(Paragraph(f"<b>Scan Started At:</b> {started_str}", normal_style))
+    if completed_str != "N/A":
+        elements.append(Paragraph(f"<b>Scan Completed At:</b> {completed_str}", normal_style))
+    elements.append(Paragraph(f"<b>Total Execution Duration:</b> {dur_str}", normal_style))
     
     risk_score = scan_data.get('risk_score', {})
     elements.append(Paragraph(f"<b>Security Score:</b> {risk_score.get('score', 'N/A')} / 100", normal_style))
     elements.append(Paragraph(f"<b>Risk Level:</b> {risk_score.get('rating', 'N/A')}", normal_style))
-    elements.append(Spacer(1, 12))
+    elements.append(Spacer(1, 14))
+
+    # Dedicated Execution & Report Timeline Section
+    elements.append(Paragraph("Report Generation & Execution Timeline", h2_style))
+    timeline_data = [
+        ["Report Generated At", report_gen_str],
+        ["Scan Started At", started_str],
+        ["Scan Completed At", completed_str],
+        ["Total Scan Duration", dur_str],
+    ]
+    t_timeline = Table(timeline_data, colWidths=[150, 330])
+    t_timeline.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (0,-1), colors.HexColor("#0f172a")),
+        ('TEXTCOLOR', (0,0), (0,-1), colors.HexColor("#38bdf8")),
+        ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 9),
+        ('BACKGROUND', (1,0), (1,-1), colors.HexColor("#f8fafc")),
+        ('TEXTCOLOR', (1,0), (1,-1), colors.HexColor("#1e293b")),
+        ('FONTNAME', (1,0), (1,-1), 'Helvetica'),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#94a3b8")),
+    ]))
+    elements.append(t_timeline)
+    elements.append(Spacer(1, 16))
     
     # Severity Summary
     elements.append(Paragraph("Severity Summary", h2_style))
@@ -142,10 +195,30 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
     buffer.seek(0)
     return buffer
 
-def generate_csv(vulns_data: list) -> io.StringIO:
+def generate_csv(vulns_data: list, scan_data: dict = None) -> io.StringIO:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["Title", "Severity", "Target URL", "Status", "Confidence", "OWASP ID", "CWE ID", "Description", "Recommendation"])
+    now_utc = datetime.now(timezone.utc)
+    report_gen_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    if scan_data:
+        target_display = scan_data.get('target_url') or (scan_data.get('target_urls', ['Unknown'])[0] if scan_data.get('target_urls') else 'Unknown')
+        started_str = _format_datetime(scan_data.get('started_at'))
+        completed_str = _format_datetime(scan_data.get('completed_at') or scan_data.get('ended_at'))
+        dur_str = _format_duration(scan_data.get('duration'))
+
+        writer.writerow(["# VulnAI DevSecOps Assessment Report"])
+        writer.writerow(["# Report Generated At", report_gen_str])
+        writer.writerow(["# Target Host / URL", target_display])
+        writer.writerow(["# Scan Started At", started_str])
+        writer.writerow(["# Scan Completed At", completed_str])
+        writer.writerow(["# Total Execution Duration", dur_str])
+        writer.writerow([])
+
+    writer.writerow([
+        "Title", "Severity", "Target URL", "Status", "Confidence",
+        "OWASP ID", "CWE ID", "Description", "Recommendation", "Report Generated At"
+    ])
     for v in vulns_data:
         writer.writerow([
             v.get('title'),
@@ -156,18 +229,44 @@ def generate_csv(vulns_data: list) -> io.StringIO:
             v.get('owasp_id'),
             v.get('cwe_id'),
             v.get('description'),
-            v.get('ai_analysis', {}).get('recommendation', '')
+            v.get('ai_analysis', {}).get('recommendation', ''),
+            report_gen_str
         ])
     buffer.seek(0)
     return buffer
 
 def generate_json(scan_data: dict, vulns_data: list) -> io.StringIO:
     buffer = io.StringIO()
+    now_utc = datetime.now(timezone.utc)
+    report_gen_iso = now_utc.isoformat()
+    duration = scan_data.get("duration")
+    dur_str = _format_duration(duration)
+
+    started = scan_data.get('started_at')
+    started_iso = started.isoformat() if isinstance(started, datetime) else str(started or "")
+    completed = scan_data.get('completed_at') or scan_data.get('ended_at')
+    completed_iso = completed.isoformat() if isinstance(completed, datetime) else str(completed or "")
+
+    target_display = scan_data.get('target_url') or (scan_data.get('target_urls', ['Unknown'])[0] if scan_data.get('target_urls') else 'Unknown')
+
     payload = {
+        "report_metadata": {
+            "report_generated_at": report_gen_iso,
+            "scan_id": str(scan_data.get("_id")),
+            "target": target_display,
+            "scan_started_at": started_iso,
+            "scan_completed_at": completed_iso,
+            "duration_seconds": duration,
+            "duration_formatted": dur_str,
+        },
         "scan_data": {
             "scan_id": str(scan_data.get("_id")),
             "target_urls": scan_data.get("target_urls", []),
-            "started_at": str(scan_data.get("started_at")),
+            "started_at": started_iso,
+            "completed_at": completed_iso,
+            "duration": duration,
+            "duration_formatted": dur_str,
+            "report_generated_at": report_gen_iso,
             "risk_score": scan_data.get("risk_score", {})
         },
         "combined_results": _json_safe(scan_data.get("combined_results", {})),
