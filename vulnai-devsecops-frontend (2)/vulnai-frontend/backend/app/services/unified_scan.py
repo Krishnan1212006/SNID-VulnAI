@@ -1442,6 +1442,32 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
         }},
     )
 
+    # Record event in db.events for live notification & WebSocket stream
+    if hasattr(db, "events") and hasattr(db.events, "insert_one"):
+        try:
+            findings_total = len(confirmed_findings) + len(potential_findings)
+            score_text = f"VulnAI Risk Score: {risk_score.get('score', 'N/A')}/100 ({risk_score.get('rating', 'Undetermined')})" if risk_score.get('score') is not None else "Risk Score: Undetermined"
+            await db.events.insert_one({
+                "owner_id": owner_id,
+                "asset_id": asset_id,
+                "scan_id": scan_id,
+                "source": "unified_scanner",
+                "type": "scan_completed",
+                "event_type": "scan_completed",
+                "severity": "medium" if findings_total > 0 else "low",
+                "title": f"Security Assessment Completed: {normalized_target}",
+                "message": f"Assessment for {normalized_target} finished with status '{overall_status.upper()}'. {score_text}. Findings: {findings_total} ({len(confirmed_findings)} confirmed, {len(potential_findings)} potential).",
+                "status": overall_status,
+                "target_url": normalized_target,
+                "risk_score": risk_score.get("score"),
+                "rating": risk_score.get("rating"),
+                "total_findings": findings_total,
+                "timestamp": datetime.now(timezone.utc),
+            })
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Failed to record completion event: %s", exc)
+
+
 
 async def run_unified_assessment(scan_id: str, db) -> None:
     """Ensure unexpected orchestration errors leave a terminal status."""

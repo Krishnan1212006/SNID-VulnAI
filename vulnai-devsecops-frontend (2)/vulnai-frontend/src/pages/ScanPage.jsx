@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { scanCheckSteps } from "../data/mockData";
 import api from "../lib/api";
+import { useNotifications } from "../context/NotificationContext";
 
 const STATE = { IDLE: "idle", VALIDATING: "validating", SCANNING: "scanning", DONE: "done" };
 const PRIVATE_RANGES = ["127.", "10.", "192.168.", "169.254.", "0.0.0.0", "localhost", "169.254.169.254"];
@@ -63,6 +64,7 @@ export default function ScanPage() {
   const scanStartTimeRef = useRef(null);
   const canvasRef = useRef(null);
   const navigate = useNavigate();
+  const { addNotification, requestNotificationPermission } = useNotifications();
 
   // Full Screen Interactive Particle Canvas Background
   useEffect(() => {
@@ -214,6 +216,7 @@ export default function ScanPage() {
   async function startScan(e) {
     e.preventDefault();
     setError("");
+    requestNotificationPermission();
 
     if (!url.trim()) {
       setError("Enter a target URL to scan.");
@@ -346,6 +349,23 @@ export default function ScanPage() {
               } finally {
                 setScanResult(scanData);
                 setState(STATE.DONE);
+
+                // Dispatch Live Notification (Desktop + In-App Toast + Audio Chime + Topbar)
+                const targetDisplay = progRes.data.target || scanTarget || url;
+                const scoreDisplay = scanData.risk_score?.score ?? progRes.data.risk_score?.score;
+                const ratingDisplay = scanData.risk_score?.rating ?? progRes.data.risk_score?.rating ?? "Low";
+                const totalF = (scanData.confirmed_count || 0) + (scanData.potential_count || 0) || (scanData.total_findings || 0);
+
+                addNotification({
+                  title: status === "completed" ? "Assessment Completed Successfully" : `Assessment ${status.replace(/_/g, " ").toUpperCase()}`,
+                  message: `Security assessment for ${targetDisplay} has completed with status '${status.toUpperCase()}'.`,
+                  target: targetDisplay,
+                  scanId: returnedScanId,
+                  status: status,
+                  riskScore: scoreDisplay,
+                  riskRating: ratingDisplay,
+                  findingsCount: totalF,
+                });
               }
             } else if (status === "completed" || status === "cancelled") {
               try {
@@ -353,10 +373,28 @@ export default function ScanPage() {
                 setScanResult(fullScan?.data || scanData);
               } finally {
                 setState(STATE.DONE);
+                const targetDisplay = scanData.target_url;
+                addNotification({
+                  title: status === "completed" ? "Scan Completed Successfully" : `Scan ${status.toUpperCase()}`,
+                  message: `Target ${targetDisplay} finished.`,
+                  target: targetDisplay,
+                  scanId: returnedScanId,
+                  status: status,
+                  riskScore: scanData.risk_score?.score,
+                  riskRating: scanData.risk_score?.rating,
+                  findingsCount: scanData.total_findings || 0,
+                });
               }
             } else {
               setState(STATE.IDLE);
               setError(progRes.data.error_message || "Scan failed to complete due to backend error.");
+              addNotification({
+                title: "Scan Execution Failed",
+                message: progRes.data.error_message || "Scan failed to complete due to backend error.",
+                target: progRes.data.target || scanTarget || url,
+                scanId: returnedScanId,
+                status: "failed",
+              });
             }
           }
         } catch (err) {
