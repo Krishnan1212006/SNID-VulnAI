@@ -407,6 +407,10 @@ async def get_assessment_results(scan_id: str, current_user: dict = Depends(get_
     if not scan.get("unified_mode"):
         raise HTTPException(status_code=400, detail="Scan is not a unified assessment")
     if not scan.get("combined_results"):
+        from app.services.unified_scan import compile_scan_results_from_disk
+        compiled_scan, _ = await compile_scan_results_from_disk(scan_id, db=db)
+        if compiled_scan and compiled_scan.get("combined_results"):
+            return compiled_scan["combined_results"]
         if scan.get("status") in ("completed", "failed", "completed_with_failures", "incomplete", "cancelled"):
             return {
                 "scan_id": scan_id,

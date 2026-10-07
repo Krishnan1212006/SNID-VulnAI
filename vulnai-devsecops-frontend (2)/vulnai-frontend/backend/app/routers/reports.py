@@ -5,6 +5,7 @@ from app.database import get_database
 from app.dependencies import get_current_user
 from app.routers.audit import log_audit_action
 from app.services.reports import generate_pdf, generate_csv, generate_json
+from app.services.unified_scan import compile_scan_results_from_disk
 
 router = APIRouter()
 
@@ -21,6 +22,11 @@ async def get_report_pdf(scan_id: str, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=404, detail="Scan not found")
         
     vulns = await db.vulnerabilities.find({"scan_id": scan_id}).to_list(length=1000)
+    if not scan.get("combined_results") or not vulns:
+        compiled_scan, compiled_vulns = await compile_scan_results_from_disk(scan_id, db=db)
+        if compiled_scan:
+            scan = compiled_scan
+            vulns = compiled_vulns
     
     pdf_buffer = generate_pdf(scan, vulns)
     
@@ -44,6 +50,11 @@ async def get_report_csv(scan_id: str, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=404, detail="Scan not found")
         
     vulns = await db.vulnerabilities.find({"scan_id": scan_id}).to_list(length=1000)
+    if not scan.get("combined_results") or not vulns:
+        compiled_scan, compiled_vulns = await compile_scan_results_from_disk(scan_id, db=db)
+        if compiled_scan:
+            scan = compiled_scan
+            vulns = compiled_vulns
     
     csv_buffer = generate_csv(vulns, scan)
     
@@ -67,6 +78,11 @@ async def get_report_json(scan_id: str, current_user: dict = Depends(get_current
         raise HTTPException(status_code=404, detail="Scan not found")
         
     vulns = await db.vulnerabilities.find({"scan_id": scan_id}).to_list(length=1000)
+    if not scan.get("combined_results") or not vulns:
+        compiled_scan, compiled_vulns = await compile_scan_results_from_disk(scan_id, db=db)
+        if compiled_scan:
+            scan = compiled_scan
+            vulns = compiled_vulns
     
     json_buffer = generate_json(scan, vulns)
     

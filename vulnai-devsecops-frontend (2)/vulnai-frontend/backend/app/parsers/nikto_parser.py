@@ -22,6 +22,7 @@ IGNORED_PATTERNS = [
     r"^-{5,}",
     r"^\+\s*\d+\s+host\(s\)\s+tested",
     r"^\+\s*No web server found",
+    r"^\+\s*No CGI Directories found",
 ]
 
 COMPILED_IGNORED = [re.compile(p, re.IGNORECASE) for p in IGNORED_PATTERNS]
@@ -128,8 +129,19 @@ def parse_nikto(
 
     seen_titles = set()
 
-    for line in raw_output.splitlines():
-        line_clean = line.strip()
+    raw_lines = []
+    for chunk in raw_output.splitlines():
+        if "+ " in chunk:
+            for sp in re.split(r'(?=\+\s+)', chunk):
+                sp_clean = sp.strip()
+                if sp_clean:
+                    raw_lines.append(sp_clean)
+        else:
+            chunk_clean = chunk.strip()
+            if chunk_clean:
+                raw_lines.append(chunk_clean)
+
+    for line_clean in raw_lines:
         if not line_clean.startswith("+"):
             continue
 

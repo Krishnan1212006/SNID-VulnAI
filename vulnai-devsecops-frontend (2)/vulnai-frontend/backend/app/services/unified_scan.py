@@ -354,6 +354,7 @@ async def _build_scanner_command(
         wsl_output_path = await _wsl_path(output_path)
         scanner_args = [
             "nikto", "-h", wsl_target, "-nointeractive", "-output", wsl_output_path, "-Format", "txt",
+            "-maxtime", "180s",
         ]
         host_header = _runtime_host_header(target) if _is_wsl_host() else None
         if host_header:
@@ -367,6 +368,7 @@ async def _build_scanner_command(
             "--add-host", "host.docker.internal:host-gateway",
             settings.nikto_docker_image,
             "-h", docker_target, "-nointeractive", "-Format", "txt",
+            "-maxtime", "180s",
         ]
         return command, output_path
 
@@ -1509,3 +1511,220 @@ async def run_unified_assessment(scan_id: str, db) -> None:
                 "error_message": f"Unified assessment finalization failed: {exc}",
             }},
         )
+
+
+async def compile_scan_results_from_disk(scan_id: str, db=None) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Parses scanner outputs on disk in scan-results/{scan_id}, correlates findings,
+    computes risk score and coverage matrices, and optionally updates PostgreSQL.
+    Returns (scan_dict, vulns_list).
+    """
+    output_dir = SCAN_RESULTS_ROOT / scan_id
+    if not output_dir.exists():
+        return None, []
+
+    scan = None
+    if db:
+        try:
+            scan = await db.scans.find_one({"_id": ObjectId(scan_id)})
+        except Exception:
+            pass
+    if not scan:
+        status_file = output_dir / "scan-status.json"
+        if status_file.exists():
+            try:
+                status_dict = json.loads(status_file.read_text(encoding="utf-8"))
+                scan = {
+                    "_id": ObjectId(scan_id),
+                    "target_url": status_dict.get("target"),
+                    "scanner_status": status_dict.get("scanners", {}),
+                    "scanner_details": status_dict.get("scanner_details", {}),
+                }
+            except Exception:
+                pass
+    if not scan:
+        return None, []
+
+    target = scan.get("target_url") or "Unknown"
+    owner_id = str(scan.get("owner_id", ""))
+    asset_id = str(scan.get("asset_id", ""))
+
+    scanner_status = dict(scan.get("scanner_status", {}))
+    scanner_details = dict(scan.get("scanner_details", {}))
+
+    status_file = output_dir / "scan-status.json"
+    if status_file.exists():
+        try:
+            sf_data = json.loads(status_file.read_text(encoding="utf-8"))
+            for k, v in sf_data.get("scanners", {}).items():
+                if k not in scanner_status or scanner_status[k] in ("queued", "running", "unknown"):
+                    scanner_status[k] = v
+            for k, v in sf_data.get("scanner_details", {}).items():
+                if k not in scanner_details:
+                    scanner_details[k] = v
+        except Exception:
+            pass
+
+    raw_findings_by_scanner: Dict[str, List[Dict[str, Any]]] = {
+        "nmap": [],
+        "nikto": [],
+        "wapiti": [],
+        "sqlmap": [],
+        "gobuster": [],
+    }
+    host_discovery_data = {"hostname": target, "resolved_ip": "Not Resolved", "host_state": "UP", "open_ports": []}
+    sqlmap_assessment_data = {"status": "SQLMap completed clean", "injection_confirmed": False, "summary": "No confirmed SQL injection."}
+
+    for scanner in CORE_SCANNERS:
+        s_file = output_dir / f"{scanner}.txt"
+        if s_file.is_file():
+            raw_out = s_file.read_text(encoding="utf-8", errors="replace")
+            if raw_out.strip():
+                scanner_status[scanner] = "completed"
+            try:
+                if scanner == "nmap":
+                    host_discovery_data = extract_nmap_host_discovery(raw_out, target)
+                    raw_findings_by_scanner["nmap"] = parse_nmap(raw_out, scan_id, target, owner_id, asset_id)
+                elif scanner == "nikto":
+                    raw_findings_by_scanner["nikto"] = parse_nikto(raw_out, scan_id, target, owner_id, asset_id)
+                elif scanner == "wapiti":
+                    raw_findings_by_scanner["wapiti"] = parse_wapiti(raw_out, scan_id, target, owner_id, asset_id)
+                elif scanner == "sqlmap":
+                    sqlmap_assessment_data = extract_sqlmap_assessment(raw_out)
+                    raw_findings_by_scanner["sqlmap"] = parse_sqlmap(raw_out, scan_id, target, owner_id, asset_id)
+                elif scanner == "gobuster":
+                    raw_findings_by_scanner["gobuster"] = parse_gobuster_observations(raw_out)
+            except Exception as e:
+                logging.getLogger(__name__).warning("Error parsing %s: %s", scanner, e)
+
+    wapp_json_path = output_dir / "wappalyzer.json"
+    wappalyzer_result = {"technologies": [], "technology_count": 0, "status": "completed"}
+    if wapp_json_path.is_file():
+        try:
+            wappalyzer_result = json.loads(wapp_json_path.read_text(encoding="utf-8"))
+            scanner_status["wappalyzer"] = "completed"
+        except Exception:
+            pass
+
+    correlated_findings_objs = correlate_and_deduplicate_findings(
+        raw_findings_by_scanner,
+        scan_id=scan_id,
+        target=target,
+        asset_id=asset_id,
+        owner_id=owner_id,
+    )
+    correlated_dicts = [f.to_dict() for f in correlated_findings_objs]
+
+    normalized_findings = {"confirmed": [], "potential": [], "informational": [], "incomplete": []}
+    for f in correlated_dicts:
+        v_status = str(f.get("verification_status", "POTENTIAL")).lower()
+        if v_status == "confirmed":
+            normalized_findings["confirmed"].append(f)
+        elif v_status == "informational":
+            normalized_findings["informational"].append(f)
+        else:
+            normalized_findings["potential"].append(f)
+
+    for idx, path_obs in enumerate(raw_findings_by_scanner.get("gobuster", []), 1):
+        normalized_findings["informational"].append({
+            "id": f"gobuster-{idx}",
+            "scanner": "Gobuster",
+            "title": f"Discovered Path: {path_obs.get('endpoint', '/')}",
+            "severity": "info",
+            "verification_status": "INFORMATIONAL",
+            "evidence": path_obs,
+        })
+
+    for idx, tech in enumerate(wappalyzer_result.get("technologies", []), 1):
+        normalized_findings["informational"].append({
+            "id": f"wappalyzer-{idx}",
+            "scanner": "Wappalyzer",
+            "title": f"Technology Detected: {tech.get('name')}",
+            "severity": "info",
+            "verification_status": "INFORMATIONAL",
+            "evidence": tech,
+        })
+
+    tool_summaries = {}
+    for tool in ALL_SCANNERS:
+        st = scanner_status.get(tool, "completed")
+        findings_count = len(raw_findings_by_scanner.get(tool, [])) if tool in raw_findings_by_scanner else (len(wappalyzer_result.get("technologies", [])) if tool == "wappalyzer" else 0)
+        tool_summaries[tool] = {
+            "tool_name": tool,
+            "status": st,
+            "duration": scanner_details.get(tool, {}).get("duration", 0.0),
+            "findings_count": findings_count,
+            "summary_message": f"{findings_count} observation(s) recorded." if findings_count else "Completed clean with no findings.",
+        }
+
+    risk_score = compute_scan_risk([*normalized_findings["confirmed"], *normalized_findings["potential"]], scanner_status=scanner_status)
+    assessment_coverage = get_assessment_coverage(scanner_status)
+    owasp_coverage = get_owasp_coverage_matrix([*normalized_findings["confirmed"], *normalized_findings["potential"]], scanner_status)
+
+    all_vulns = [*normalized_findings["confirmed"], *normalized_findings["potential"], *normalized_findings["informational"]]
+    combined_results = {
+        "scan_id": scan_id,
+        "target": target,
+        "status": "completed",
+        "scanner_status": scanner_status,
+        "scanner_details": scanner_details,
+        "tool_summaries": tool_summaries,
+        "risk_score": risk_score,
+        "assessment_coverage": assessment_coverage,
+        "owasp_coverage": owasp_coverage,
+        "host_discovery": host_discovery_data,
+        "technology_detection": wappalyzer_result,
+        "sql_assessment": sqlmap_assessment_data,
+        "confirmed": normalized_findings["confirmed"],
+        "potential": normalized_findings["potential"],
+        "informational": normalized_findings["informational"],
+        "incomplete": normalized_findings["incomplete"],
+        "total_findings": len(all_vulns),
+        "confirmed_count": len(normalized_findings["confirmed"]),
+        "potential_count": len(normalized_findings["potential"]),
+        "informational_count": len(normalized_findings["informational"]),
+    }
+
+    scan["combined_results"] = combined_results
+    scan["risk_score"] = risk_score
+    scan["host_discovery"] = host_discovery_data
+    scan["technology_detection"] = wappalyzer_result
+    scan["tool_summaries"] = tool_summaries
+    scan["scanner_status"] = scanner_status
+    scan["scanner_details"] = scanner_details
+    scan["status"] = "completed"
+
+    if db:
+        try:
+            await db.scans.update_one(
+                {"_id": ObjectId(scan_id)},
+                {"$set": {
+                    "combined_results": combined_results,
+                    "risk_score": risk_score,
+                    "host_discovery": host_discovery_data,
+                    "technology_detection": wappalyzer_result,
+                    "tool_summaries": tool_summaries,
+                    "scanner_status": scanner_status,
+                    "scanner_details": scanner_details,
+                    "status": "completed",
+                    "progress": 100,
+                    "ended_at": datetime.now(timezone.utc),
+                }}
+            )
+            if all_vulns and hasattr(db, "vulnerabilities"):
+                await db.vulnerabilities.delete_many({"scan_id": scan_id})
+                vuln_docs = []
+                for v in all_vulns:
+                    doc = copy.deepcopy(v)
+                    doc.setdefault("scan_id", scan_id)
+                    doc.setdefault("asset_id", asset_id)
+                    doc.setdefault("owner_id", owner_id)
+                    doc.setdefault("target_url", target)
+                    doc.setdefault("status", "open")
+                    doc.setdefault("created_at", datetime.now(timezone.utc))
+                    vuln_docs.append(doc)
+                await db.vulnerabilities.insert_many(vuln_docs)
+        except Exception as db_exc:
+            logging.getLogger(__name__).warning("Failed to persist compiled results for %s: %s", scan_id, db_exc)
+
+    return scan, all_vulns

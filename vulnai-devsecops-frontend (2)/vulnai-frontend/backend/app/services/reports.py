@@ -392,9 +392,9 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
     ))
     elements.append(Spacer(1, 6))
 
-    tool_summaries = combined_results.get('tool_summaries', {})
-    scanner_details = combined_results.get('scanner_details', {})
-    scanner_status = combined_results.get('scanner_status', {})
+    tool_summaries = combined_results.get('tool_summaries', {}) or scan_data.get('tool_summaries', {})
+    scanner_details = combined_results.get('scanner_details', {}) or scan_data.get('scanner_details', {})
+    scanner_status = combined_results.get('scanner_status', {}) or scan_data.get('scanner_status', {})
 
     tools_table_rows = [
         [
@@ -410,15 +410,19 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
     for t_name in all_tool_names:
         ts = tool_summaries.get(t_name) if isinstance(tool_summaries.get(t_name), dict) else {}
         sd = scanner_details.get(t_name) if isinstance(scanner_details.get(t_name), dict) else {}
-        st = ts.get('status') or (scanner_status.get(t_name) if isinstance(scanner_status, dict) else None) or 'unknown'
+        st = ts.get('status') or (scanner_status.get(t_name) if isinstance(scanner_status, dict) else None) or (scan_data.get('scanner_status', {}).get(t_name)) or 'unknown'
         dur = ts.get('duration') or sd.get('duration') or sd.get('execution_seconds')
         f_count = ts.get('findings_count', 0)
+        if not f_count and vulns_data:
+            f_count = sum(1 for v in vulns_data if str(v.get('source', '')).lower() == t_name or str(v.get('scanner', '')).lower() == t_name)
         
         # If tool completed and detected 0 confirmed/potential findings
         if st == 'completed':
             ver_text = f"{f_count} observation(s)" if f_count > 0 else "Execution Completed (No findings)"
-        elif st in ('running', 'queued'):
+        elif st in ('running', 'queued') or scan_data.get('status') == 'running':
             ver_text = "In Progress"
+            if st == 'unknown':
+                st = 'running'
         elif st == 'cancelled':
             ver_text = "Cancelled by User"
         elif st == 'timed_out':
@@ -452,7 +456,7 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
     # 5. HOST INFORMATION & PORT DISCOVERY (NMAP)
     # =========================================================================
     elements.append(Paragraph("4. Host Information & Port Discovery (Nmap)", h2_style))
-    host_disc = combined_results.get('host_discovery') or {}
+    host_disc = combined_results.get('host_discovery') or scan_data.get('host_discovery') or {}
     hostname = host_disc.get('hostname', target_display)
     resolved_ip = host_disc.get('resolved_ip', 'Not Resolved')
     host_state = host_disc.get('host_state', 'UP')
@@ -526,7 +530,7 @@ def generate_pdf(scan_data: dict, vulns_data: list) -> io.BytesIO:
     ))
     elements.append(Spacer(1, 6))
 
-    tech_detection = combined_results.get('technology_detection') or {}
+    tech_detection = combined_results.get('technology_detection') or scan_data.get('technology_detection') or {}
     technologies = tech_detection.get('technologies', [])
     tech_rows = [
         [
