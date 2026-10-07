@@ -34,6 +34,7 @@ from app.services.risk_scoring import compute_scan_risk
 from app.services.scanner import SSRFProtectionError, validate_url_for_ssrf
 from app.services.scanner_runtime import decode_output, scanner_runtime
 from app.services.scan_job_manager import scan_job_manager
+from app.services.http_analyzer import analyze_target_http
 from app.core.config import settings
 CORE_SCANNERS = ("nmap", "nikto", "wapiti", "sqlmap", "gobuster")
 ALL_SCANNERS = ("nmap", "nikto", "wapiti", "sqlmap", "gobuster", "wappalyzer")
@@ -329,12 +330,12 @@ def aggregate_scanner_status(scanner_states: Dict[str, str], is_cancelled: bool 
         return "cancelled"
     if not scanner_states or any(state in {"queued", "running"} for state in scanner_states.values()):
         return "running"
-    terminal_states = {"completed", "failed", "timed_out", "unavailable", "skipped", "cancelled"}
+    terminal_states = {"completed", "failed", "timed_out", "timeout", "unavailable", "skipped", "cancelled"}
     if any(state not in terminal_states for state in scanner_states.values()):
         return "running"
     if all(state == "completed" for state in scanner_states.values()):
         return "completed"
-    if any(state in {"failed", "timed_out"} for state in scanner_states.values()):
+    if any(state in {"failed", "timed_out", "timeout"} for state in scanner_states.values()):
         return "failed"
     return "incomplete"
 
@@ -700,7 +701,7 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             if name in status_data["scanners"]:
                 status_data["scanners"][name] = detail["status"]
             status_data["scanner_details"][name] = detail
-            finished = sum(value in {"completed", "failed", "timed_out", "unavailable", "skipped", "cancelled"} for value in status_data["scanners"].values())
+            finished = sum(value in {"completed", "failed", "timed_out", "timeout", "unavailable", "skipped", "cancelled"} for value in status_data["scanners"].values())
             is_cancelled = scan_job_manager.is_cancelled(scan_id)
             try:
                 await db.scans.update_one(
@@ -771,13 +772,15 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             runtime_status["local_target_connectivity"] = {"available": False, "error": gateway_error}
     if gateway is not None:
         runtime_status["local_target_connectivity"] = {"available": True, "gateway": gateway}
+    http_analysis = await analyze_target_http(normalized_target)
     if gateway_error:
-        wildcard_size = None
+        wildcard_size = http_analysis.get("wildcard_length")
     else:
         probe_target = await _target_for_scanner_runtime(normalized_target, gateway)
         wildcard_size = await _wildcard_response_size(
             probe_target, _runtime_host_header(normalized_target)
-        )
+        ) or http_analysis.get("wildcard_length")
+    runtime_status["http_analysis"] = http_analysis
     await _write_status_file(output_dir, status_data)
     await db.scans.update_one(
         {"_id": ObjectId(scan_id)}, {"$set": {"runtime_status": runtime_status}}
@@ -908,11 +911,11 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
                     failure_stage="cancelled",
                     completed_at=_utc_now(),
                 )
-            elif p_status == "timed_out":
+            elif p_status in ("timed_out", "timeout"):
                 detail.update(
-                    status="timed_out",
+                    status=p_status,
                     exit_code=p_exit_code,
-                    error=f"Scanner exceeded the job safety limit of {settings.scan_job_timeout_seconds}s",
+                    error=f"Scanner exceeded the job safety limit of {settings.scan_job_timeout_seconds}s (assessment incomplete for this tool)",
                     failure_stage="job_timeout",
                     completed_at=_utc_now(),
                 )
@@ -1187,10 +1190,11 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
     }
 
     for f in correlated_findings_dicts:
-        verif = str(f.get("verification_status", "POTENTIAL")).lower()
+        verif = str(f.get("verification_status") or f.get("status") or "POTENTIAL").lower()
+        sev = str(f.get("severity", "LOW")).lower()
         if verif == "confirmed":
             normalized_findings["confirmed"].append(f)
-        elif verif == "informational":
+        elif verif == "informational" or sev == "info":
             normalized_findings["informational"].append(f)
         else:
             normalized_findings["potential"].append(f)
@@ -1354,6 +1358,7 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
         "technology_detection": wappalyzer_result,
         "host_discovery": host_discovery_data,
         "sql_assessment": sqlmap_assessment_data,
+        "http_analysis": runtime_status.get("http_analysis", {}),
         "assessment_coverage": assessment_coverage,
         "owasp_coverage": owasp_coverage,
         "tool_summaries": tool_summaries,
@@ -1415,11 +1420,30 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
                 doc.setdefault("scan_id", scan_id)
                 doc.setdefault("asset_id", asset_id)
                 doc.setdefault("owner_id", owner_id)
+                doc.setdefault("target", normalized_target)
                 doc.setdefault("target_url", normalized_target)
-                doc.setdefault("status", "open")
+                tool_val = doc.get("tool") or doc.get("source") or (doc.get("detected_by", ["nikto"])[0].lower() if doc.get("detected_by") else "nikto")
+                doc["tool"] = tool_val.lower()
+                doc["source"] = doc["tool"]
+                sev_val = str(doc.get("severity", "LOW")).upper()
+                doc["severity"] = sev_val
+                conf_val = doc.get("confidence", 85)
+                if isinstance(conf_val, (int, float)):
+                    doc["confidence"] = int(conf_val if conf_val > 1 else conf_val * 100)
+                elif isinstance(conf_val, str):
+                    c_map = {"CONFIRMED": 95, "HIGH": 85, "POTENTIAL": 75, "MEDIUM": 70, "LOW": 50, "INFORMATIONAL": 20}
+                    doc["confidence"] = c_map.get(conf_val.upper(), 75)
+                doc.setdefault("status", "potential")
                 doc.setdefault("created_at", datetime.now(timezone.utc))
                 vuln_docs.append(doc)
             await db.vulnerabilities.insert_many(vuln_docs)
+            if hasattr(db, "findings") and hasattr(db.findings, "insert_many"):
+                try:
+                    if hasattr(db.findings, "delete_many"):
+                        await db.findings.delete_many({"scan_id": scan_id})
+                    await db.findings.insert_many(vuln_docs)
+                except Exception:
+                    pass
         except Exception as exc:
             logging.getLogger(__name__).warning("Failed to insert findings into vulnerabilities collection: %s", exc)
 

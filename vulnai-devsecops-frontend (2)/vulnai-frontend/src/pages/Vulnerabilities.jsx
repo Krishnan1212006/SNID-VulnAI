@@ -4,7 +4,7 @@ import VulnerabilityTable from "../components/VulnerabilityTable";
 import { severityColors } from "../data/mockData";
 import api from "../lib/api";
 
-const LEVELS = ["critical", "high", "medium", "low"];
+const LEVELS = ["critical", "high", "medium", "low", "info"];
 
 // Cyberpunk Neon Palette Map
 const CYBER_NEON = {
@@ -12,6 +12,7 @@ const CYBER_NEON = {
   high: { bg: "rgba(255, 107, 0, 0.15)", border: "#FF6B00", text: "#FF6B00", shadow: "0 0 15px rgba(255, 107, 0, 0.4)" },
   medium: { bg: "rgba(255, 199, 0, 0.15)", border: "#FFC700", text: "#FFC700", shadow: "0 0 15px rgba(255, 199, 0, 0.4)" },
   low: { bg: "rgba(0, 229, 255, 0.15)", border: "#00E5FF", text: "#00E5FF", shadow: "0 0 15px rgba(0, 229, 255, 0.4)" },
+  info: { bg: "rgba(168, 85, 247, 0.15)", border: "#A855F7", text: "#A855F7", shadow: "0 0 15px rgba(168, 85, 247, 0.4)" },
 };
 
 export default function Vulnerabilities() {
@@ -28,7 +29,7 @@ export default function Vulnerabilities() {
   useEffect(() => {
     async function fetchVulns() {
       try {
-        const res = await api.get("/vulnerabilities/");
+        const res = await api.get("/findings").catch(() => api.get("/vulnerabilities/"));
         setVulnerabilities(res.data);
       } catch (err) {
         console.error("Failed to load vulnerabilities:", err);
@@ -67,24 +68,63 @@ export default function Vulnerabilities() {
     fetchUnifiedObservations();
   }, []);
 
+  const [activeClassification, setActiveClassification] = useState("all");
+
   function toggleLevel(level) {
     setActiveLevels((prev) => (prev.includes(level) ? prev.filter((l) => l !== level) : [...prev, level]));
   }
 
+  const classificationCounts = useMemo(() => {
+    let confirmed = 0, potential = 0, informational = 0, incomplete = 0;
+    vulnerabilities.forEach((v) => {
+      const st = (v.status || v.verification_status || "potential").toLowerCase();
+      const sev = (v.severity || "info").toLowerCase();
+      if (st === "confirmed") confirmed++;
+      else if (st === "incomplete") incomplete++;
+      else if (st === "informational" || st === "info" || sev === "info") informational++;
+      else potential++;
+    });
+    return { all: vulnerabilities.length, confirmed, potential, informational, incomplete };
+  }, [vulnerabilities]);
+
   const filtered = useMemo(() => {
     return vulnerabilities.filter((v) => {
+      const q = query.toLowerCase();
+      const title = (v.title || "").toLowerCase();
+      const category = (v.category || "").toLowerCase();
+      const target = (v.target || v.target_url || "").toLowerCase();
+      const endpoint = (v.endpoint || v.path || "").toLowerCase();
+      const cve = (v.cve || v.cve_id || "").toLowerCase();
+      const tool = (v.tool || v.source || "").toLowerCase();
+      const detectedBy = (v.detected_by || []).join(" ").toLowerCase();
+
       const matchesQuery =
         !query ||
-        v.title.toLowerCase().includes(query.toLowerCase()) ||
-        v.category.toLowerCase().includes(query.toLowerCase()) ||
-        v.target_url.toLowerCase().includes(query.toLowerCase());
-      const matchesLevel = activeLevels.length === 0 || activeLevels.includes(v.severity);
-      return matchesQuery && matchesLevel;
+        title.includes(q) ||
+        category.includes(q) ||
+        target.includes(q) ||
+        endpoint.includes(q) ||
+        cve.includes(q) ||
+        tool.includes(q) ||
+        detectedBy.includes(q);
+
+      const vSev = (v.severity || "low").toLowerCase();
+      const matchesLevel = activeLevels.length === 0 || activeLevels.includes(vSev);
+
+      const st = (v.status || v.verification_status || "potential").toLowerCase();
+      const matchesClassification =
+        activeClassification === "all" ||
+        (activeClassification === "confirmed" && st === "confirmed") ||
+        (activeClassification === "potential" && (st === "potential" || (st !== "confirmed" && st !== "incomplete" && st !== "informational" && vSev !== "info"))) ||
+        (activeClassification === "informational" && (st === "informational" || st === "info" || vSev === "info")) ||
+        (activeClassification === "incomplete" && st === "incomplete");
+
+      return matchesQuery && matchesLevel && matchesClassification;
     });
-  }, [query, activeLevels]);
+  }, [vulnerabilities, query, activeLevels, activeClassification]);
 
   const counts = LEVELS.reduce((acc, level) => {
-    acc[level] = vulnerabilities.filter((v) => v.severity === level).length;
+    acc[level] = vulnerabilities.filter((v) => (v.severity || "").toLowerCase() === level).length;
     return acc;
   }, {});
 
@@ -119,6 +159,35 @@ export default function Vulnerabilities() {
         </div>
       </div>
 
+      {/* Classification Quick Filter Tabs */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-cyan-500/20 pb-3">
+        {[
+          { key: "all", label: "All Findings", count: classificationCounts.all, activeBg: "bg-cyan-500/20 border-cyan-400 text-cyan-300 shadow-[0_0_15px_rgba(0,240,255,0.25)]" },
+          { key: "confirmed", label: "Confirmed Vulnerabilities", count: classificationCounts.confirmed, activeBg: "bg-rose-500/20 border-rose-500 text-rose-300 shadow-[0_0_15px_rgba(244,63,94,0.3)]" },
+          { key: "potential", label: "Potential Issues", count: classificationCounts.potential, activeBg: "bg-amber-500/20 border-amber-500 text-amber-300 shadow-[0_0_15px_rgba(245,158,11,0.3)]" },
+          { key: "informational", label: "Informational Observations", count: classificationCounts.informational, activeBg: "bg-blue-500/20 border-blue-500 text-blue-300 shadow-[0_0_15px_rgba(59,130,246,0.3)]" },
+          { key: "incomplete", label: "Incomplete Checks", count: classificationCounts.incomplete, activeBg: "bg-purple-500/20 border-purple-500 text-purple-300 shadow-[0_0_15px_rgba(168,85,247,0.3)]" },
+        ].map((tab) => {
+          const isActive = activeClassification === tab.key;
+          return (
+            <button
+              key={tab.key}
+              onClick={() => setActiveClassification(tab.key)}
+              className={`flex items-center gap-2 rounded-xl border px-3.5 py-2 font-mono text-xs font-bold uppercase tracking-wider transition-all duration-200 ${
+                isActive
+                  ? `${tab.activeBg} scale-[1.02]`
+                  : "border-slate-800 bg-[#03060D]/80 text-slate-400 hover:border-slate-700 hover:text-slate-300"
+              }`}
+            >
+              <span>{tab.label}</span>
+              <span className={`rounded-md px-1.5 py-0.5 text-[10px] ${isActive ? "bg-black/50 text-white font-mono" : "bg-slate-800 text-slate-400"}`}>
+                {tab.count}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
       {/* Control Panel: Search & Severity Filters */}
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between rounded-2xl bg-[#070D1B]/80 p-4 border border-cyan-500/25 shadow-[0_0_30px_rgba(0,0,0,0.5)] backdrop-blur-2xl">
         
@@ -128,7 +197,7 @@ export default function Vulnerabilities() {
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search title, category or target..."
+            placeholder="Search title, target, endpoint, CVE, tool, category..."
             className="w-full rounded-xl border border-cyan-500/30 bg-[#03060D]/90 py-2.5 pl-10 pr-4 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-400 focus:bg-[#03060D] focus:outline-none focus:ring-1 focus:ring-cyan-400/50 shadow-inner transition-all duration-300"
           />
         </div>
@@ -162,9 +231,9 @@ export default function Vulnerabilities() {
                     : {}
                 }
               >
-                {level}
+                {level === "info" ? "Informational" : level}
                 <span className={`ml-1.5 rounded-md px-1.5 py-0.5 text-[10px] ${isActive ? "bg-black/40 text-white" : "bg-slate-800/80 text-slate-400 group-hover:text-slate-200"}`}>
-                  {counts[level]}
+                  {counts[level] || 0}
                 </span>
               </button>
             );

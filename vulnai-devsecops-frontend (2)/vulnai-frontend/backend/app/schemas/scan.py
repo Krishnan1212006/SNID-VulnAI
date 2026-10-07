@@ -3,6 +3,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional, Any, Dict
 
 class ScanCreate(BaseModel):
+    target: Optional[str] = None
     asset_id: Optional[str] = None
     target_urls: Optional[List[str]] = None  # If not provided, will scan all URLs from asset
     authorized: bool = Field(..., description="Must confirm authorization")
@@ -10,16 +11,38 @@ class ScanCreate(BaseModel):
     kali_mode: bool = False
     unified_mode: bool = False
 
+    model_config = ConfigDict(extra='ignore')
+
+class ToolExecutionStatus(BaseModel):
+    status: str = Field(default="pending", description="pending|running|completed|timeout|failed")
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    duration_seconds: float = 0.0
+    raw_output: str = ""
+    error: Optional[str] = None
+
+    model_config = ConfigDict(extra='ignore')
+
 class ScanResponse(BaseModel):
     id: str
-    asset_id: str
-    owner_id: str
-    status: str
-    progress: int
+    scan_id: Optional[str] = None
+    target: Optional[str] = None
+    hostname: Optional[str] = None
+    ip: Optional[str] = None
+    asset_id: Optional[str] = None
+    owner_id: Optional[str] = None
+    status: str = "running"
+    progress: int = 0
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    duration: Optional[float] = None
     target_url: Optional[str] = None
     target_urls: Optional[List[str]] = None   # Alias for Reports page compatibility
+    tools: Optional[Dict[str, Any]] = None
+    findings: Optional[List[Dict[str, Any]]] = None
+    score: Optional[int] = None
+    risk_level: Optional[str] = None
     security_score: Optional[int] = None
     risk_score: Optional[Dict[str, Any]] = None  # Full nested risk score object
     total_findings: Optional[int] = 0
@@ -33,9 +56,6 @@ class ScanResponse(BaseModel):
     evidence_files: Optional[Dict[str, str]] = {}
     report_html_path: Optional[str] = None
     report_md_path: Optional[str] = None
-
-    completed_at: Optional[datetime] = None
-    duration: Optional[float] = None
     tool_summaries: Optional[Dict[str, Any]] = {}
 
     model_config = ConfigDict(extra='ignore')

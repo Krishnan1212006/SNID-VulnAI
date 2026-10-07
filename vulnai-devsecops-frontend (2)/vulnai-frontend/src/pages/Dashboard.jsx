@@ -15,7 +15,11 @@ import {
   ShieldCheck,
   Zap,
   Lock,
-  Globe
+  Globe,
+  CheckCircle2,
+  AlertCircle,
+  Info,
+  HelpCircle
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -184,47 +188,36 @@ export default function Dashboard() {
               <div className="absolute bottom-0 right-0 w-4 h-4 border-b-2 border-r-2 border-cyan-400 shadow-[0_0_10px_#00f0ff]" />
 
               <div className="relative z-10 w-full flex flex-col items-center">
-                <ScoreGauge score={latestScan.risk_score?.score || 100} />
+                <ScoreGauge score={metrics.security_score ?? latestScan.risk_score?.score ?? 100} />
                 <div className="mt-4 px-3.5 py-1.5 bg-[#03060D]/90 border border-cyan-500/30 rounded-xl text-center shadow-[0_0_10px_rgba(0,240,255,0.1)] flex items-center gap-2">
                   <Globe size={13} className="text-cyan-400" />
                   <p className="text-[11px] text-slate-300">
-                    Target: <span className="font-mono text-cyan-300 font-bold">{latestScan.target_url}</span>
+                    Target: <span className="font-mono text-cyan-300 font-bold">{latestScan.target_url && latestScan.target_url !== "-" ? latestScan.target_url : (metrics.target || "-")}</span>
                   </p>
                 </div>
               </div>
             </div>
 
-            {/* Stat Cards Grid */}
+            {/* Stat Cards Grid - Section 22 Categorization */}
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:col-span-3 lg:grid-cols-3">
               <div className="hover:-translate-y-1.5 transition-all duration-300">
-                <StatCard label="Total Findings" value={metrics.unresolved_findings} icon={Bug} accent="purple" />
+                <StatCard label="Total Findings" value={metrics.total_findings ?? metrics.unresolved_findings ?? 0} icon={Bug} accent="purple" />
               </div>
               <div className="hover:-translate-y-1.5 transition-all duration-300">
-                <StatCard label="Critical Issues" value={metrics.severity_distribution?.critical || 0} icon={ShieldAlert} accent="critical" />
+                <StatCard label="Confirmed Vulns" value={metrics.confirmed_vulnerabilities ?? 0} icon={CheckCircle2} accent="critical" />
               </div>
               <div className="hover:-translate-y-1.5 transition-all duration-300">
-                <StatCard label="Open Incidents" value={metrics.active_incidents} icon={Bell} accent="high" />
+                <StatCard label="Potential Issues" value={metrics.potential_vulnerabilities ?? metrics.unresolved_findings ?? 0} icon={AlertCircle} accent="high" />
               </div>
               <div className="hover:-translate-y-1.5 transition-all duration-300">
-                <StatCard label="Scans Completed" value={metrics.total_scans} icon={ListChecks} accent="blue" />
+                <StatCard label="Informational Obs" value={metrics.informational_observations ?? metrics.informational ?? 0} icon={Info} accent="blue" />
               </div>
               <div className="hover:-translate-y-1.5 transition-all duration-300">
-                <StatCard label="Avg. Confidence" value="92" suffix="%" icon={ScanLine} accent="low" />
+                <StatCard label="Incomplete Checks" value={metrics.incomplete_checks ?? 0} icon={HelpCircle} accent="medium" />
               </div>
-
-              {/* Action Trigger Card */}
-              <Link
-                to="/scan"
-                className="group relative flex flex-col items-center justify-center gap-3 p-5 text-center rounded-2xl bg-[#070D1B]/80 border border-cyan-500/30 hover:border-cyan-400 transition-all duration-300 shadow-[0_0_20px_rgba(0,240,255,0.1)] hover:shadow-[0_0_35px_rgba(0,240,255,0.35)] backdrop-blur-2xl overflow-hidden hover:scale-[1.02]"
-              >
-                <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/20 via-purple-500/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
-                <div className="relative z-10 border border-cyan-400/80 p-3 rounded-xl text-cyan-400 bg-cyan-950/50 group-hover:bg-cyan-400 group-hover:text-black transition-all duration-300 shadow-[0_0_20px_rgba(0,240,255,0.5)]">
-                  <Plus size={24} strokeWidth={2.5} />
-                </div>
-                <span className="relative z-10 text-xs font-bold uppercase tracking-widest text-cyan-300 group-hover:text-white transition-colors">
-                  Initiate New Scan
-                </span>
-              </Link>
+              <div className="hover:-translate-y-1.5 transition-all duration-300">
+                <StatCard label="Avg. Confidence" value={metrics.average_confidence ?? 85} suffix="%" icon={ScanLine} accent="low" />
+              </div>
             </div>
 
           </div>

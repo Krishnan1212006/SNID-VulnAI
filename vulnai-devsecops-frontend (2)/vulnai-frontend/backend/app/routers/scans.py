@@ -2,7 +2,8 @@ import copy
 from datetime import datetime, timezone, timedelta
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from urllib.parse import urlsplit
 import os
 from app.core.ids import ObjectId
 from app.services.scan_job_manager import scan_job_manager
@@ -22,6 +23,207 @@ from app.services.unified_scan import SCANNER_BINARIES
 from app.services.scanner_runtime import scanner_runtime
 
 router = APIRouter()
+
+
+def _format_scan_response(s: Dict[str, Any], live_job=None) -> Dict[str, Any]:
+    s_id = str(s.get("_id") or s.get("id") or "")
+    target = s.get("target_url") or (s.get("target_urls")[0] if s.get("target_urls") else None)
+    hostname = None
+    if target:
+        try:
+            parsed = urlsplit(target if "://" in target else f"https://{target}")
+            hostname = parsed.hostname or target
+        except Exception:
+            hostname = target
+
+    comb = s.get("combined_results") or {}
+    host_disc = comb.get("host_discovery") or s.get("host_discovery") or {}
+    resolved_ip = host_disc.get("resolved_ip") if host_disc.get("resolved_ip") != "Not Resolved" else None
+
+    risk_score_obj = s.get("risk_score") or comb.get("risk_score") or {}
+    score = s.get("security_score")
+    if score is None and isinstance(risk_score_obj, dict):
+        score = risk_score_obj.get("score")
+    if score is None:
+        score = 100
+
+    risk_level = "LOW"
+    if isinstance(risk_score_obj, dict):
+        risk_level = str(risk_score_obj.get("risk_level") or risk_score_obj.get("rating") or "LOW").upper()
+
+    scanner_status = s.get("scanner_status") or comb.get("scanner_status") or {}
+    scanner_details = s.get("scanner_details") or comb.get("scanner_details") or {}
+    ALL_TOOLS = ("nmap", "nikto", "wapiti", "sqlmap", "gobuster", "wappalyzer")
+    tools_dict = {}
+
+    for t in ALL_TOOLS:
+        detail = scanner_details.get(t, {})
+        live_tool = live_job.tools.get(t) if live_job else None
+
+        raw_st = (live_tool.status if live_tool else None) or detail.get("status") or scanner_status.get(t) or "pending"
+        if raw_st in ("queued", "pending"):
+            tool_status = "pending"
+        elif raw_st in ("running",):
+            tool_status = "running"
+        elif raw_st in ("completed",):
+            tool_status = "completed"
+        elif raw_st in ("timed_out", "timeout"):
+            tool_status = "timeout"
+        else:
+            tool_status = "failed"
+
+        dur = (live_tool.duration if live_tool else None) or detail.get("duration") or detail.get("execution_seconds") or 0.0
+        raw_out = (live_tool.stdout if live_tool else None) or detail.get("stdout") or detail.get("output") or ""
+        err = (live_tool.error_message if live_tool else None) or detail.get("error")
+
+        tools_dict[t] = {
+            "status": tool_status,
+            "started_at": str(detail.get("started_at")) if detail.get("started_at") else None,
+            "completed_at": str(detail.get("completed_at")) if detail.get("completed_at") else None,
+            "duration_seconds": round(float(dur), 2),
+            "raw_output": raw_out,
+            "error": err,
+        }
+
+    tools_dict["nappalyzer"] = tools_dict["wappalyzer"]
+
+    findings_list = comb.get("correlated_findings") or [
+        *comb.get("confirmed", []),
+        *comb.get("potential", []),
+        *comb.get("informational", []),
+    ] or s.get("results", [])
+
+    duration_val = _compute_scan_duration(s, live_job)
+
+    res = dict(s)
+    res["id"] = s_id
+    res["scan_id"] = s_id
+    res["target"] = target
+    res["target_url"] = target
+    res["target_urls"] = s.get("target_urls") or ([target] if target else [])
+    res["hostname"] = hostname
+    res["ip"] = resolved_ip
+    res["score"] = score
+    res["security_score"] = score
+    res["risk_level"] = risk_level
+    res["tools"] = tools_dict
+    res["findings"] = findings_list
+    res["total_findings"] = len(findings_list)
+    res["duration"] = duration_val
+    if res.get("completed_at") is None and res.get("ended_at") is not None:
+        res["completed_at"] = res.get("ended_at")
+    return res
+
+
+@router.post("/", response_model=ScanResponse, status_code=status.HTTP_201_CREATED)
+async def create_scan(
+    scan: ScanCreate, 
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    if not scan.authorized:
+        raise HTTPException(status_code=400, detail="Cannot create scan without confirmed authorization.")
+
+    if scan.kali_mode and not settings.kali_enabled:
+        raise HTTPException(status_code=503, detail="Comprehensive scanner mode is disabled on this server.")
+
+    if scan.kali_mode and scan.unified_mode:
+        raise HTTPException(status_code=400, detail="Choose either legacy Kali mode or unified assessment mode.")
+    
+    db = get_database()
+    owner_id = str(current_user["_id"])
+    target_url = scan.target or (scan.target_urls[0] if scan.target_urls and len(scan.target_urls) > 0 else None)
+    asset_id = scan.asset_id
+
+    # If asset_id is not provided but target is, automatically create/resolve the asset
+    if not asset_id:
+        if not target_url:
+            raise HTTPException(status_code=400, detail="Target URL or Asset ID is required to start a scan.")
+        parsed_target = urlsplit(target_url if "://" in target_url else f"https://{target_url}")
+        target_name = f"Scan Target: {parsed_target.hostname or target_url}"
+        existing_asset = await db.assets.find_one({
+            "name": target_name,
+            "owner_id": owner_id,
+        })
+        if existing_asset:
+            asset_id = str(existing_asset["_id"])
+        else:
+            new_asset = {
+                "name": target_name,
+                "target_urls": [target_url],
+                "environment": "development",
+                "owner_id": owner_id,
+                "created_at": datetime.now(timezone.utc),
+            }
+            res_asset = await db.assets.insert_one(new_asset)
+            asset_id = str(res_asset.inserted_id)
+        # Default to unified 6-tool assessment pipeline
+        if not scan.kali_mode:
+            scan.unified_mode = True
+    else:
+        # Verify existing asset ownership
+        asset = await db.assets.find_one({
+            "_id": ObjectId(asset_id), 
+            "owner_id": owner_id,
+        })
+        if not asset:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        if not target_url and asset.get("target_urls") and len(asset["target_urls"]) > 0:
+            target_url = asset["target_urls"][0]
+
+    if scan.unified_mode:
+        if not target_url:
+            raise HTTPException(status_code=400, detail="A target URL is required for unified assessment.")
+        try:
+            target_url = validate_assessment_target(target_url, lab_mode=scan.lab_mode)
+        except AssessmentTargetError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    new_scan = {
+        "asset_id": asset_id,
+        "owner_id": owner_id,
+        "status": "queued",
+        "progress": 0,
+        "lab_mode": scan.lab_mode,
+        "kali_mode": scan.kali_mode,
+        "unified_mode": scan.unified_mode,
+        "target_url": target_url,
+        "target_urls": [target_url] if target_url else [],
+        "started_at": datetime.now(timezone.utc),
+        "ended_at": None,
+        "results": [],
+    }
+    
+    result = await db.scans.insert_one(new_scan)
+    scan_id = str(result.inserted_id)
+    new_scan["id"] = scan_id
+    new_scan["_id"] = result.inserted_id
+    
+    # Launch background job based on scan mode
+    if scan.unified_mode:
+        background_tasks.add_task(run_unified_assessment, scan_id, db)
+    elif scan.kali_mode:
+        background_tasks.add_task(run_kali_scan, scan_id, db)
+    else:
+        background_tasks.add_task(run_wapiti_scan, scan_id, db)
+    
+    await log_audit_action(current_user["_id"], "Authorization Confirmed", {"asset_id": asset_id, "target_urls": [target_url] if target_url else [], "kali_mode": scan.kali_mode})
+    await log_audit_action(current_user["_id"], "Scan Started", {"scan_id": scan_id, "asset_id": asset_id, "kali_mode": scan.kali_mode})
+    
+    return _format_scan_response(new_scan)
+
+
+@router.get("/", response_model=List[ScanResponse])
+async def get_scans(current_user: dict = Depends(get_current_user)):
+    db = get_database()
+    scans = await db.scans.find({"owner_id": str(current_user["_id"])}).sort("started_at", -1).to_list(length=100)
+    
+    formatted_scans = []
+    for s in scans:
+        live_job = scan_job_manager.get_scan(str(s.get("_id")))
+        formatted_scans.append(_format_scan_response(s, live_job))
+    return formatted_scans
+
 
 
 @router.get("/runtime-status")
@@ -435,12 +637,8 @@ async def get_latest_scan(current_user: dict = Depends(get_current_user)):
     scan = await db.scans.find_one({"owner_id": str(current_user["_id"])}, sort=[("started_at", -1)])
     if not scan:
         return None
-    scan["id"] = str(scan["_id"])
-    if scan.get("duration") is None:
-        scan["duration"] = _compute_scan_duration(scan)
-    if scan.get("completed_at") is None and scan.get("ended_at") is not None:
-        scan["completed_at"] = scan.get("ended_at")
-    return scan
+    live_job = scan_job_manager.get_scan(str(scan.get("_id")))
+    return _format_scan_response(scan, live_job)
 
 @router.get("/{scan_id}", response_model=ScanResponse)
 async def get_scan_status(scan_id: str, current_user: dict = Depends(get_current_user)):
@@ -454,11 +652,9 @@ async def get_scan_status(scan_id: str, current_user: dict = Depends(get_current
     if not s:
         raise HTTPException(status_code=404, detail="Scan not found")
         
-    s["id"] = str(s["_id"])
-    if s.get("duration") is None:
-        live_job = scan_job_manager.get_scan(scan_id)
-        s["duration"] = _compute_scan_duration(s, live_job)
-    return s
+    live_job = scan_job_manager.get_scan(scan_id)
+    return _format_scan_response(s, live_job)
+
 
 @router.get("/{scan_id}/progress")
 async def get_scan_progress(scan_id: str, current_user: dict = Depends(get_current_user)):

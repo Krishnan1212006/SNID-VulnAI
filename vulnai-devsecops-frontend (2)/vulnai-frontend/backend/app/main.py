@@ -8,7 +8,7 @@ from app.database import connect_to_postgres, close_postgres_connection
 from app.core.config import settings
 from app.routers import auth, scans, vulnerabilities, reports, assets, websockets, ai
 from app.routers import history, devices, events, incidents, network
-from app.routers import devsecops, monitoring, audit, risk, dashboard
+from app.routers import devsecops, monitoring, audit, risk, dashboard, findings
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ app.include_router(monitoring.router, prefix="/api/monitoring", tags=["Monitorin
 app.include_router(audit.router, prefix="/api/audit", tags=["Audit"])
 app.include_router(risk.router, prefix="/api/risk", tags=["Risk"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
+app.include_router(findings.router, prefix="/api/findings", tags=["Findings"])
 
 # WebSockets
 app.include_router(websockets.router, tags=["WebSockets"])

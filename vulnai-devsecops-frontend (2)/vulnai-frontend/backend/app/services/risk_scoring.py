@@ -12,19 +12,26 @@ if POTENTIAL findings exist.
 from typing import List, Dict, Any, Optional
 
 # Configurable deduction weights
+# Configurable deduction weights
+# Standard VulnAI Assessment Deductions:
+# CRITICAL = 20.0
+# HIGH = 10.0
+# MEDIUM = 4.0
+# LOW = 1.5
+# INFO = 0.0
 RISK_WEIGHTS = {
     # Confirmed vulnerabilities (validated evidence)
     "confirmed": {
-        "critical": 25.0,
-        "high": 18.0,
-        "medium": 10.0,
-        "low": 4.0,
+        "critical": 20.0,
+        "high": 10.0,
+        "medium": 4.0,
+        "low": 1.5,
         "info": 0.0,
     },
     # Potential findings (unverified scanner observations)
     "potential": {
-        "critical": 12.0,
-        "high": 8.0,
+        "critical": 20.0,
+        "high": 10.0,
         "medium": 4.0,
         "low": 1.5,
         "info": 0.0,
@@ -42,6 +49,7 @@ RISK_WEIGHTS = {
         "penalty_per_incomplete": 3.0,
     }
 }
+
 
 
 class ProjectRiskScoreEngine:
@@ -121,7 +129,7 @@ class ProjectRiskScoreEngine:
         # Check for incomplete / timed out scanner jobs
         incomplete_scanners = [
             scanner for scanner, st in self.scanner_status.items()
-            if st in ("timed_out", "incomplete", "cancelled")
+            if st in ("timed_out", "timeout", "incomplete", "cancelled")
         ]
         if incomplete_scanners:
             penalty = len(incomplete_scanners) * RISK_WEIGHTS["incomplete"]["penalty_per_incomplete"]
@@ -139,23 +147,55 @@ class ProjectRiskScoreEngine:
 
         if final_score >= 85:
             rating = "Low"
-        elif final_score >= 65:
+        elif final_score >= 70:
             rating = "Medium"
-        elif final_score >= 45:
+        elif final_score >= 40:
             rating = "High"
         else:
             rating = "Critical"
+
+        # Mathematical score breakdown for transparent calculation display
+        low_ded = sum(d["deduction"] for d in deduction_items if str(d.get("severity")).upper() == "LOW")
+        med_ded = sum(d["deduction"] for d in deduction_items if str(d.get("severity")).upper() == "MEDIUM")
+        high_ded = sum(d["deduction"] for d in deduction_items if str(d.get("severity")).upper() == "HIGH")
+        crit_ded = sum(d["deduction"] for d in deduction_items if str(d.get("severity")).upper() == "CRITICAL")
+
+        formula_parts = ["100"]
+        if low_ded > 0:
+            formula_parts.append(f"({round(low_ded / 1.5)} × 1.5 = -{round(low_ded, 1)})")
+        if med_ded > 0:
+            formula_parts.append(f"({round(med_ded / 4.0)} × 4 = -{round(med_ded, 1)})")
+        if high_ded > 0:
+            formula_parts.append(f"({round(high_ded / 10.0)} × 10 = -{round(high_ded, 1)})")
+        if crit_ded > 0:
+            formula_parts.append(f"({round(crit_ded / 20.0)} × 20 = -{round(crit_ded, 1)})")
+
+        calculation_details = {
+            "base_score": 100,
+            "deductions_by_severity": {
+                "low": {"count": round(low_ded / 1.5) if low_ded else 0, "rate": 1.5, "total": round(low_ded, 1)},
+                "medium": {"count": round(med_ded / 4.0) if med_ded else 0, "rate": 4.0, "total": round(med_ded, 1)},
+                "high": {"count": round(high_ded / 10.0) if high_ded else 0, "rate": 10.0, "total": round(high_ded, 1)},
+                "critical": {"count": round(crit_ded / 20.0) if crit_ded else 0, "rate": 20.0, "total": round(crit_ded, 1)},
+            },
+            "total_deductions": round(total_deductions, 1),
+            "final_score": final_score,
+            "risk_level": rating.upper(),
+            "formula_string": f"100 - {round(total_deductions, 1)} = {final_score}",
+        }
 
         return {
             "score": final_score,
             "score_display": f"{final_score} / 100",
             "rating": rating,
+            "risk_level": rating.upper(),
             "model": "VulnAI Project Risk Score (Project-Defined)",
             "model_name": "VulnAI Project Risk Score (Project-Defined)",
             "base_score": 100,
             "total_deductions": round(total_deductions, 1),
             "deductions": deduction_items,
             "explanation": deduction_items,
+            "calculation": calculation_details,
             "counts": {
                 "confirmed": confirmed_count,
                 "potential": potential_count,
@@ -164,6 +204,7 @@ class ProjectRiskScoreEngine:
             },
             "is_indeterminate": False,
         }
+
 
 
 def compute_scan_risk(

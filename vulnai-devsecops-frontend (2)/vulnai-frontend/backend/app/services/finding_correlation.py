@@ -17,6 +17,27 @@ def _canonical_key_for_finding(finding: Dict[str, Any], scanner: str) -> Optiona
     raw = str(finding.get("evidence", {}).get("raw", "")).lower()
     combined = f"{title} {desc} {raw}"
 
+    # Open Port Discovery
+    if "open port discovery" in title:
+        port_m = re.search(r"(\d+)/(?:tcp|udp)", title)
+        return f"info:open_port_{port_m.group(1)}" if port_m else f"info:open_port_{title[:20]}"
+
+    # Filtered ports
+    if "filtered" in title and "port" in title:
+        return "info:filtered_ports"
+
+    # HTTP redirect
+    if "redirects to https" in title:
+        return "info:http_redirect"
+
+    # Valid TLS cert
+    if "valid tls certificate" in title:
+        return "info:valid_tls_cert"
+
+    # OS fingerprint
+    if "operating system fingerprint" in title:
+        return "info:os_fingerprint"
+
     # Clickjacking / X-Frame-Options
     if any(k in combined for k in ["x-frame-options", "clickjacking", "anti-clickjacking", "frame-ancestors"]):
         return "misconfig:clickjacking_x_frame_options"
@@ -117,13 +138,61 @@ CANONICAL_DEFINITIONS = {
         "owasp_category": "A05:2021 - Security Misconfiguration",
         "cwe": "CWE-200",
         "wstg": "WSTG-INFO-02",
-        "severity": "low",
+        "severity": "info",
         "verification_status": FindingVerification.INFORMATIONAL,
         "impact": "Disclosing the web server software product and version banner assists threat actors in fingerprinting the attack surface and selecting version-specific exploits.",
         "recommendation": "Configure web server tokens to return generic banners (e.g., ServerTokens Prod in Apache, server_tokens off in Nginx).",
         "references": [
             "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/01-Information_Gathering/02-Fingerprint_Web_Server"
         ]
+    },
+    "info:filtered_ports": {
+        "title": "Most scanned TCP ports are filtered",
+        "category": "Network Exposure",
+        "owasp_category": "N/A",
+        "cwe": "Not mapped",
+        "wstg": "WSTG-INFO-01",
+        "severity": "info",
+        "verification_status": FindingVerification.INFORMATIONAL,
+        "impact": "Indicates network perimeter packet filtering or firewall dropping unsolicited connection requests.",
+        "recommendation": "Maintain strict default-deny firewall policies on perimeter routers.",
+        "references": ["https://nmap.org/book/man-port-scanning-basics.html"]
+    },
+    "info:http_redirect": {
+        "title": "HTTP redirects to HTTPS",
+        "category": "Transport Security",
+        "owasp_category": "A02:2021 - Cryptographic Failures",
+        "cwe": "Not mapped",
+        "wstg": "WSTG-CRYP-01",
+        "severity": "info",
+        "verification_status": FindingVerification.INFORMATIONAL,
+        "impact": "Plaintext traffic is redirected to an encrypted channel.",
+        "recommendation": "Ensure HSTS is also deployed to prevent SSL-stripping during the initial connection.",
+        "references": ["https://developer.mozilla.org/en-US/docs/Web/HTTP/Redirections"]
+    },
+    "info:valid_tls_cert": {
+        "title": "Valid TLS Certificate Detected",
+        "category": "Cryptographic Assets",
+        "owasp_category": "A02:2021 - Cryptographic Failures",
+        "cwe": "Not mapped",
+        "wstg": "WSTG-CRYP-01",
+        "severity": "info",
+        "verification_status": FindingVerification.INFORMATIONAL,
+        "impact": "SSL/TLS certificate is active, cryptographically valid, and protects transport layer confidentiality.",
+        "recommendation": "Monitor expiration timeline and ensure automated renewals.",
+        "references": ["https://owasp.org/www-project-top-ten/2021/A02_2021-Cryptographic_Failures/"]
+    },
+    "info:os_fingerprint": {
+        "title": "Operating System Fingerprint (Uncertain)",
+        "category": "System Fingerprinting",
+        "owasp_category": "N/A",
+        "cwe": "Not mapped",
+        "wstg": "WSTG-INFO-02",
+        "severity": "info",
+        "verification_status": FindingVerification.INFORMATIONAL,
+        "impact": "TCP/IP stack response timing and flags matched multiple divergent operating systems.",
+        "recommendation": "Operating system detection is an informational reconnaissance metric.",
+        "references": ["https://nmap.org/book/osdetect.html"]
     },
     "misconfig:http_trace_enabled": {
         "title": "HTTP TRACE Method Enabled (XST Risk)",

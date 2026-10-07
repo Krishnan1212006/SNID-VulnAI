@@ -12,7 +12,10 @@ import {
   Clock,
   Calendar,
   CheckCircle2,
-  Timer
+  Timer,
+  Eye,
+  X,
+  FileCode
 } from "lucide-react";
 import api from "../lib/api";
 
@@ -71,7 +74,22 @@ export default function Reports() {
   const [downloadingKey, setDownloadingKey] = useState(null);
   const [lastExported, setLastExported] = useState({});
   const [currentTime, setCurrentTime] = useState(new Date().toLocaleTimeString());
+  const [viewingReport, setViewingReport] = useState(null);
+  const [reportLoading, setReportLoading] = useState(false);
   const canvasRef = useRef(null);
+
+  async function handleViewReport(scanId) {
+    setReportLoading(true);
+    try {
+      const res = await api.get(`/reports/${scanId}`);
+      setViewingReport(res.data);
+    } catch (err) {
+      console.error("Failed to load report", err);
+      alert("Error loading report details: " + (err.message || "Failed to load"));
+    } finally {
+      setReportLoading(false);
+    }
+  }
 
   // Live Clock ticker
   useEffect(() => {
@@ -258,12 +276,14 @@ export default function Reports() {
         <div className="rounded-2xl border border-cyan-500/25 bg-[#070D1B]/80 shadow-[0_0_40px_rgba(0,240,255,0.05)] backdrop-blur-2xl overflow-hidden">
           
           {/* Table Header */}
-          <div className="hidden grid-cols-12 gap-3 border-b border-cyan-500/20 bg-[#03060D]/90 px-6 py-3.5 font-mono text-[11px] uppercase tracking-wider text-cyan-400 font-bold md:grid">
+          <div className="hidden grid-cols-12 gap-2 border-b border-cyan-500/20 bg-[#03060D]/90 px-6 py-3.5 font-mono text-[11px] uppercase tracking-wider text-cyan-400 font-bold md:grid">
             <div className="col-span-3 flex items-center gap-1.5"><Database size={13}/> Target Host / Asset</div>
-            <div className="col-span-3 flex items-center gap-1.5"><Clock size={13}/> Scan Time & Duration</div>
-            <div className="col-span-2">Security Score</div>
-            <div className="col-span-1">Risk Level</div>
-            <div className="col-span-3 text-right pr-4">Export Options</div>
+            <div className="col-span-2 flex items-center gap-1.5"><Clock size={13}/> Timestamp & Duration</div>
+            <div className="col-span-1">Score</div>
+            <div className="col-span-1">Risk</div>
+            <div className="col-span-1">Findings</div>
+            <div className="col-span-1">Status</div>
+            <div className="col-span-3 text-right pr-2">Report Actions</div>
           </div>
 
           {/* Table Rows */}
@@ -279,6 +299,9 @@ export default function Reports() {
             ) : (
               scanHistory.map((scan) => {
                 const scanExportInfo = lastExported[scan.id];
+                const findingsTotal = scan.findings_count ?? scan.total_findings ?? (scan.findings ? scan.findings.length : 0);
+                const scanStatus = (scan.status || "completed").toUpperCase();
+
                 return (
                   <div 
                     key={scan.id} 
@@ -287,59 +310,78 @@ export default function Reports() {
                     {/* Target Column */}
                     <div className="font-mono text-xs font-bold text-slate-100 md:col-span-3 truncate flex items-center gap-2">
                       <span className="h-2 w-2 rounded-full bg-cyan-400 shadow-[0_0_8px_#00f0ff] flex-shrink-0" />
-                      <span className="truncate" title={scan.target_urls?.[0] || scan.asset_id}>
-                        {scan.target_urls?.[0] || scan.asset_id}
+                      <span className="truncate" title={scan.target_urls?.[0] || scan.target || scan.asset_id}>
+                        {scan.target_urls?.[0] || scan.target || scan.asset_id}
                       </span>
                     </div>
 
                     {/* Time & Execution Timeline Column */}
-                    <div className="text-xs text-slate-300 md:col-span-3 font-mono space-y-1">
+                    <div className="text-xs text-slate-300 md:col-span-2 font-mono space-y-1">
                       <div className="flex items-center gap-1.5 font-medium text-slate-200">
                         <Calendar size={12} className="text-cyan-400 flex-shrink-0" />
                         <span className="text-[11px] text-slate-200">{formatDateTime(scan.started_at)}</span>
                       </div>
                       
                       <div className="flex flex-wrap items-center gap-2 text-[10px]">
-                        {scan.completed_at && (
-                          <span className="flex items-center gap-1 text-slate-400">
-                            <CheckCircle2 size={10} className="text-emerald-400 flex-shrink-0" />
-                            <span>Done: {formatTimeOnly(scan.completed_at)}</span>
-                          </span>
-                        )}
-                        
                         {scan.duration != null && scan.duration > 0 && (
                           <span className="inline-flex items-center gap-1 rounded bg-cyan-950/60 border border-cyan-500/30 px-1.5 py-0.5 text-[10px] font-bold text-cyan-300 shadow-[0_0_8px_rgba(0,240,255,0.15)]">
                             <Timer size={10} className="text-cyan-400" />
                             {formatDuration(scan.duration)}
-                            <span className="text-[9px] text-cyan-400/60 font-normal">({Math.round(scan.duration)}s)</span>
                           </span>
                         )}
                       </div>
                     </div>
 
                     {/* Score Column */}
-                    <div className="text-xs font-extrabold text-cyan-300 md:col-span-2 font-mono">
-                      <span className="rounded-md bg-cyan-950/60 border border-cyan-500/30 px-2.5 py-1 text-cyan-300 shadow-[0_0_10px_rgba(0,240,255,0.15)]">
-                        {scan.risk_score?.score ?? scan.security_score ?? 0} / 100
+                    <div className="text-xs font-extrabold text-cyan-300 md:col-span-1 font-mono">
+                      <span className="rounded-md bg-cyan-950/60 border border-cyan-500/30 px-2 py-0.5 text-cyan-300 text-[11px] shadow-[0_0_10px_rgba(0,240,255,0.15)]">
+                        {scan.risk_score?.score ?? scan.security_score ?? scan.score ?? 0}/100
                       </span>
                     </div>
 
                     {/* Rating Badge */}
                     <div className="text-xs md:col-span-1">
                       <span className={`inline-block rounded-md border px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wider ${
-                        scan.risk_score?.rating?.toLowerCase() === 'high' || scan.risk_score?.rating?.toLowerCase() === 'critical'
+                        (scan.risk_score?.rating || scan.risk_level || "").toLowerCase() === 'high' || (scan.risk_score?.rating || scan.risk_level || "").toLowerCase() === 'critical'
                           ? 'border-rose-500/40 bg-rose-950/40 text-rose-400 shadow-[0_0_10px_rgba(244,63,94,0.3)]'
-                          : scan.risk_score?.rating?.toLowerCase() === 'medium'
+                          : (scan.risk_score?.rating || scan.risk_level || "").toLowerCase() === 'medium'
                           ? 'border-yellow-500/40 bg-yellow-950/40 text-yellow-400 shadow-[0_0_10px_rgba(234,179,8,0.3)]'
                           : 'border-emerald-500/40 bg-emerald-950/40 text-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.3)]'
                       }`}>
-                        {scan.risk_score?.rating || "SAFE"}
+                        {scan.risk_score?.rating || scan.risk_level || "SAFE"}
+                      </span>
+                    </div>
+
+                    {/* Finding Count Column */}
+                    <div className="text-xs md:col-span-1 font-mono">
+                      <span className="text-slate-300 font-bold">{findingsTotal}</span>
+                      <span className="text-[10px] text-slate-500 ml-1">issues</span>
+                    </div>
+
+                    {/* Status Column */}
+                    <div className="text-xs md:col-span-1">
+                      <span className={`inline-block rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider border ${
+                        scanStatus === 'COMPLETED'
+                          ? 'border-emerald-500/30 bg-emerald-950/30 text-emerald-300'
+                          : scanStatus === 'RUNNING'
+                          ? 'border-cyan-500/30 bg-cyan-950/30 text-cyan-300 animate-pulse'
+                          : 'border-rose-500/30 bg-rose-950/30 text-rose-300'
+                      }`}>
+                        {scanStatus}
                       </span>
                     </div>
 
                     {/* Export Buttons & Report Generated Feedback Container */}
                     <div className="flex flex-col items-start md:items-end gap-1 md:col-span-3">
-                      <div className="flex flex-wrap items-center justify-start md:justify-end gap-2">
+                      <div className="flex flex-wrap items-center justify-start md:justify-end gap-1.5">
+                        <button
+                          onClick={() => handleViewReport(scan.id)}
+                          className="flex items-center gap-1 rounded-lg border border-cyan-500/40 bg-cyan-950/40 px-2.5 py-1.5 text-xs font-bold text-cyan-300 hover:bg-cyan-400 hover:text-black transition-all duration-200 shadow-[0_0_10px_rgba(0,240,255,0.2)]"
+                          title="View Comprehensive 17-Section Report in UI"
+                        >
+                          <Eye size={12} />
+                          <span>VIEW</span>
+                        </button>
                         <ExportButton 
                           icon={FileText} 
                           label="PDF" 
@@ -348,18 +390,18 @@ export default function Reports() {
                           isDownloading={downloadingKey === `${scan.id}-pdf`}
                         />
                         <ExportButton 
+                          icon={FileCode} 
+                          label="MD" 
+                          onClick={() => handleDownload(scan.id, "markdown")} 
+                          color="emerald"
+                          isDownloading={downloadingKey === `${scan.id}-markdown`}
+                        />
+                        <ExportButton 
                           icon={FileJson} 
                           label="JSON" 
                           onClick={() => handleDownload(scan.id, "json")} 
                           color="blue"
                           isDownloading={downloadingKey === `${scan.id}-json`}
-                        />
-                        <ExportButton 
-                          icon={FileSpreadsheet} 
-                          label="CSV" 
-                          onClick={() => handleDownload(scan.id, "csv")} 
-                          color="purple"
-                          isDownloading={downloadingKey === `${scan.id}-csv`}
                         />
                       </div>
                       {scanExportInfo && (
@@ -378,6 +420,114 @@ export default function Reports() {
         </div>
 
       </div>
+
+      {/* Interactive Cyber Report Modal */}
+      {viewingReport && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn">
+          <div className="relative w-full max-w-4xl max-h-[90vh] overflow-y-auto rounded-3xl border border-cyan-500/40 bg-[#070D1B] p-6 shadow-[0_0_60px_rgba(0,240,255,0.2)] text-slate-100 font-mono space-y-6">
+            
+            {/* Modal Header */}
+            <div className="flex items-start justify-between border-b border-cyan-500/20 pb-4">
+              <div>
+                <div className="flex items-center gap-2">
+                  <ShieldCheck size={20} className="text-cyan-400" />
+                  <h2 className="text-base font-extrabold uppercase tracking-wider text-cyan-300">
+                    Security Assessment Report
+                  </h2>
+                </div>
+                <p className="text-xs text-slate-400 mt-1">
+                  Target: <span className="text-cyan-200 font-bold">{viewingReport.target || viewingReport.executive_summary?.target}</span> · Scan ID: <span className="text-slate-500">{viewingReport.scan_id}</span>
+                </p>
+              </div>
+              <button
+                onClick={() => setViewingReport(null)}
+                className="rounded-xl border border-slate-700 p-2 text-slate-400 hover:border-rose-500 hover:text-rose-400 hover:bg-rose-950/30 transition-all"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Quick Summary Cards */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+              <div className="p-3 rounded-xl border border-cyan-500/20 bg-[#03060D]">
+                <p className="text-[10px] text-slate-400 uppercase">Risk Score</p>
+                <p className="text-lg font-extrabold text-cyan-300 mt-1">{viewingReport.executive_summary?.score_display || `${viewingReport.risk_score_calculation?.final_score}/100`}</p>
+                <p className="text-[10px] text-slate-500 mt-0.5">Rating: {viewingReport.executive_summary?.risk_level || viewingReport.risk_score_calculation?.risk_level}</p>
+              </div>
+              <div className="p-3 rounded-xl border border-cyan-500/20 bg-[#03060D]">
+                <p className="text-[10px] text-slate-400 uppercase">Assessment Status</p>
+                <p className="text-sm font-bold text-emerald-400 mt-2 uppercase">{viewingReport.executive_summary?.status || "COMPLETED"}</p>
+              </div>
+              <div className="p-3 rounded-xl border border-cyan-500/20 bg-[#03060D]">
+                <p className="text-[10px] text-slate-400 uppercase">Confirmed / Potential</p>
+                <p className="text-sm font-bold text-slate-200 mt-2">
+                  <span className="text-rose-400">{viewingReport.executive_summary?.confirmed_count || 0}</span> confirmed · <span className="text-amber-400">{viewingReport.executive_summary?.potential_count || 0}</span> potential
+                </p>
+              </div>
+              <div className="p-3 rounded-xl border border-cyan-500/20 bg-[#03060D]">
+                <p className="text-[10px] text-slate-400 uppercase">Informational</p>
+                <p className="text-sm font-bold text-cyan-300 mt-2">{viewingReport.executive_summary?.informational_count || 0} observations</p>
+              </div>
+            </div>
+
+            {/* Section: Transparent Score Calculation */}
+            {viewingReport.risk_score_calculation && (
+              <div className="p-4 rounded-2xl border border-cyan-500/25 bg-[#03060D]/90 space-y-3">
+                <h3 className="text-xs font-extrabold uppercase text-cyan-300 flex items-center gap-1.5">
+                  <Cpu size={14} className="text-cyan-400" /> Transparent VulnAI Project Risk Score Calculation
+                </h3>
+                <p className="text-[11px] text-slate-400">
+                  Starting Base Score: <span className="text-slate-200 font-bold">100 points</span>. Configurable deductions applied per verified evidence.
+                </p>
+                
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                  {Object.entries(viewingReport.risk_score_calculation.summary || {}).map(([sev, data]) => (
+                    <div key={sev} className="p-2.5 rounded-lg border border-slate-800 bg-[#070D1B]">
+                      <p className="text-[10px] uppercase text-slate-400 font-bold">{sev}</p>
+                      <p className="text-xs text-slate-200 font-mono mt-0.5">
+                        {data.count} × {data.points_each} = <span className="text-rose-400 font-bold">-{data.total} pts</span>
+                      </p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between border-t border-slate-800 pt-2 text-xs">
+                  <span className="text-slate-400">Mathematical Formula:</span>
+                  <span className="font-bold text-cyan-300">{viewingReport.risk_score_calculation.formula}</span>
+                </div>
+              </div>
+            )}
+
+            {/* Section: Scanner Matrix */}
+            <div className="space-y-2">
+              <h3 className="text-xs font-bold uppercase text-slate-300">Tool Execution Matrix</h3>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
+                {(viewingReport.tool_execution_summary || []).map((t) => (
+                  <div key={t.tool} className="p-2.5 rounded-xl border border-cyan-500/15 bg-[#03060D] flex items-center justify-between">
+                    <div>
+                      <p className="font-bold capitalize text-slate-200">{t.tool}</p>
+                      <p className="text-[10px] text-slate-500">{t.duration_seconds}s</p>
+                    </div>
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                      t.status === 'completed' ? 'bg-emerald-950/60 text-emerald-300 border border-emerald-500/30' : 'bg-amber-950/60 text-amber-300 border border-amber-500/30'
+                    }`}>
+                      {t.status}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Download Buttons inside modal */}
+            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-cyan-500/20 pt-4">
+              <ExportButton icon={FileText} label="DOWNLOAD PDF" onClick={() => handleDownload(viewingReport.scan_id, "pdf")} color="cyan" />
+              <ExportButton icon={FileCode} label="DOWNLOAD MARKDOWN" onClick={() => handleDownload(viewingReport.scan_id, "markdown")} color="emerald" />
+              <ExportButton icon={FileJson} label="DOWNLOAD JSON" onClick={() => handleDownload(viewingReport.scan_id, "json")} color="blue" />
+            </div>
+
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -386,7 +536,8 @@ function ExportButton({ icon: Icon, label, onClick, color, isDownloading }) {
   const colorStyles = {
     cyan: "border-cyan-500/30 bg-cyan-950/30 text-cyan-300 hover:bg-cyan-500 hover:text-slate-950 hover:shadow-[0_0_15px_rgba(0,240,255,0.5)]",
     blue: "border-blue-500/30 bg-blue-950/30 text-blue-300 hover:bg-blue-500 hover:text-slate-950 hover:shadow-[0_0_15px_rgba(59,130,246,0.5)]",
-    purple: "border-purple-500/30 bg-purple-950/30 text-purple-300 hover:bg-purple-500 hover:text-slate-950 hover:shadow-[0_0_15px_rgba(168,85,247,0.5)]"
+    purple: "border-purple-500/30 bg-purple-950/30 text-purple-300 hover:bg-purple-500 hover:text-slate-950 hover:shadow-[0_0_15px_rgba(168,85,247,0.5)]",
+    emerald: "border-emerald-500/30 bg-emerald-950/30 text-emerald-300 hover:bg-emerald-500 hover:text-slate-950 hover:shadow-[0_0_15px_rgba(16,185,129,0.5)]"
   };
 
   return (
