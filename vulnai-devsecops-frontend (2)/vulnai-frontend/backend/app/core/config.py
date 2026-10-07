@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     scan_timeout_seconds: int = 15
     scan_job_timeout_seconds: int = 1800
     max_redirects: int = 5
-    scanner_wsl_distribution: str = "Ubuntu"
+    scanner_wsl_distribution: str = "kali-linux"
     nikto_docker_image: str = "sullo/nikto:latest"
     scanner_docker_command: str = "docker"
 

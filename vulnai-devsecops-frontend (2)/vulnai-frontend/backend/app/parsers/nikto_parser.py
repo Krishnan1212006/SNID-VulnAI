@@ -23,15 +23,36 @@ IGNORED_PATTERNS = [
     r"^\+\s*\d+\s+host\(s\)\s+tested",
     r"^\+\s*No web server found",
     r"^\+\s*No CGI Directories found",
+    r"^\+\s*ERROR:",
+    r"^-\s*STATUS:",
+    r"^\+\s*Scan terminated:",
+    r"^\+\s*SSL Info:",
+    r"^\+\s*Platform:",
+    r"^\+\s*Ciphers:",
+    r"^\+\s*Issuer:",
+    r"^\+\s*SAN:",
+    r"^\+\s*CN:",
 ]
 
 COMPILED_IGNORED = [re.compile(p, re.IGNORECASE) for p in IGNORED_PATTERNS]
 
 
 def _classify_nikto_line(line_text: str) -> Dict[str, Any]:
-    lower = line_text.lower()
+    # Strip Nikto 2.6 ID prefix like "[013587] /: "
+    cleaned = re.sub(r"^\[\d+\]\s*[^:]*:\s*", "", line_text).strip()
+    lower = cleaned.lower()
 
-    if "trace method is active" in lower or "xst" in lower:
+    if "content-security-policy" in lower or "missing: csp" in lower:
+        return {
+            "title": "Missing Content Security Policy (CSP)",
+            "severity": "low",
+            "category": "Security Misconfiguration",
+            "owasp_id": "A05:2021",
+            "cwe_id": "CWE-1021",
+            "impact": "Absence of a Content Security Policy increases risk of Cross-Site Scripting (XSS) and data injection.",
+            "recommendation": "Define a Content-Security-Policy response header restricting authorized sources of content."
+        }
+    elif "trace method is active" in lower or "xst" in lower:
         return {
             "title": "HTTP TRACE Method Enabled (XST Risk)",
             "severity": "medium",

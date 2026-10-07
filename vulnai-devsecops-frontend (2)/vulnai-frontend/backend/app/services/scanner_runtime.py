@@ -31,8 +31,8 @@ class ScannerRuntime:
 
     @staticmethod
     def _normalize_distribution(distribution: Optional[str]) -> str:
-        candidate = (distribution or settings.scanner_wsl_distribution or "Ubuntu").strip()
-        return candidate or "Ubuntu"
+        candidate = (distribution or settings.scanner_wsl_distribution or "kali-linux").strip()
+        return candidate or "kali-linux"
 
     def __init__(self, distribution: Optional[str] = None):
         self.distribution = self._normalize_distribution(distribution)

@@ -2,6 +2,7 @@ import asyncio
 import sys
 import pytest
 
+from app.core.config import settings
 from app.services.scanner_runtime import CommandResult, ScannerRuntime
 
 SCANNERS = {name: {"binary": name} for name in ("nmap", "nikto", "wapiti", "sqlmap", "gobuster")}
@@ -95,9 +96,10 @@ def test_wsl_command_adapter_uses_configured_ubuntu_distribution():
 
 def test_wsl_command_adapter_rejects_blank_distribution_name_and_falls_back_to_default():
     runtime = ScannerRuntime("   ")
-    assert runtime.distribution == "Ubuntu"
+    expected = settings.scanner_wsl_distribution or "Ubuntu"
+    assert runtime.distribution == expected
     assert runtime.wrap_runtime_command(["nmap", "-Pn", "127.0.0.1"]) == [
-        "wsl.exe", "-d", "Ubuntu", "--", "nmap", "-Pn", "127.0.0.1"
+        "wsl.exe", "-d", expected, "--", "nmap", "-Pn", "127.0.0.1"
     ]
 
 
