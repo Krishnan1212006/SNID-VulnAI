@@ -29,7 +29,19 @@ async function request(endpoint, options = {}) {
       localStorage.removeItem("token");
       window.dispatchEvent(new Event("auth:logout"));
     }
-    const error = new Error(data?.detail || "HTTP Error");
+    let errorMsg = "HTTP Error";
+    if (typeof data?.detail === "string") {
+      errorMsg = data.detail;
+    } else if (Array.isArray(data?.detail) && data.detail.length > 0) {
+      errorMsg = data.detail.map((d) => d.msg || JSON.stringify(d)).join("; ");
+    } else if (typeof data?.message === "string") {
+      errorMsg = data.message;
+    } else if (response.statusText) {
+      errorMsg = `${response.status} ${response.statusText}`;
+    } else {
+      errorMsg = `Server returned status ${response.status}`;
+    }
+    const error = new Error(errorMsg);
     error.status = response.status;
     error.data = data;
     throw error;

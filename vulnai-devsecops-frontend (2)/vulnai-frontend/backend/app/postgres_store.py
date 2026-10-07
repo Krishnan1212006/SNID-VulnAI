@@ -163,14 +163,17 @@ class PostgresCollection:
         self.name = name
         self.pool = pool
 
-    def _execute_with_retry(self, fn, max_attempts: int = 2):
+    def _execute_with_retry(self, fn, max_attempts: int = 3):
+        import time
         from psycopg import OperationalError
+        from psycopg_pool import PoolTimeout
         for attempt in range(max_attempts):
             try:
                 return fn()
-            except OperationalError:
+            except (OperationalError, PoolTimeout) as exc:
                 if attempt == max_attempts - 1:
                     raise
+                time.sleep(0.4 * (attempt + 1))
 
     @staticmethod
     def _project(document: dict[str, Any], projection: dict[str, int] | None) -> dict[str, Any]:
@@ -430,7 +433,8 @@ async def connect_to_postgres() -> None:
         conninfo=settings.database_url,
         kwargs={"row_factory": dict_row, "prepare_threshold": None},
         min_size=1,
-        max_size=10,
+        max_size=25,
+        timeout=15.0,
         max_idle=60,
         max_lifetime=300,
         check=ConnectionPool.check_connection,

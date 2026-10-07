@@ -298,6 +298,7 @@ export default function ScanPage() {
           ]);
 
           const currentProgress = progRes.data.progress || 0;
+          pollingFails = 0;
           const status = progRes.data.status;
           setProgress(currentProgress);
           setScannerStatus(progRes.data.scanners || progRes.data.scanner_status || {});
@@ -400,11 +401,11 @@ export default function ScanPage() {
         } catch (err) {
           console.error("Polling error:", err);
           pollingFails += 1;
-          if (pollingFails > 8) {
+          if (pollingFails > 20) {
             clearInterval(timerRef.current);
             if (tickTimerRef.current) clearInterval(tickTimerRef.current);
             setState(STATE.IDLE);
-            setError("Lost communication with backend scanner.");
+            setError("Lost communication with backend scanner. Please verify server connectivity or retry.");
           }
         }
       }, 1500);

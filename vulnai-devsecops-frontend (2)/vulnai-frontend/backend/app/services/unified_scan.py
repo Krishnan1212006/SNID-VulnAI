@@ -700,17 +700,20 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
             status_data["scanner_details"][name] = detail
             finished = sum(value in {"completed", "failed", "timed_out", "unavailable", "skipped", "cancelled"} for value in status_data["scanners"].values())
             is_cancelled = scan_job_manager.is_cancelled(scan_id)
-            await db.scans.update_one(
-                {"_id": ObjectId(scan_id)},
-                {"$set": {
-                    "status": "cancelled" if is_cancelled else "running",
-                    "progress": int(finished * 100 / len(SCANNERS)),
-                    "scanner_status": dict(status_data["scanners"]),
-                    "scanner_details": dict(status_data["scanner_details"]),
-                    "runtime_status": status_data.get("runtime_status"),
-                }},
-            )
-            await _persist_scanner_job(db, scan_id, name, detail)
+            try:
+                await db.scans.update_one(
+                    {"_id": ObjectId(scan_id)},
+                    {"$set": {
+                        "status": "cancelled" if is_cancelled else "running",
+                        "progress": int(finished * 100 / len(SCANNERS)),
+                        "scanner_status": dict(status_data["scanners"]),
+                        "scanner_details": dict(status_data["scanner_details"]),
+                        "runtime_status": status_data.get("runtime_status"),
+                    }},
+                )
+                await _persist_scanner_job(db, scan_id, name, detail)
+            except Exception as db_exc:
+                logger.warning("Could not persist scanner status to DB for %s: %s", name, db_exc)
             await _write_status_file(output_dir, status_data)
 
     try:
@@ -912,18 +915,25 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
                     completed_at=_utc_now(),
                 )
             else:
-                detail["status"] = p_status
+                has_output = bool(stdout and stdout.strip()) or (output_path.exists() and output_path.stat().st_size > 0)
+                output_error = _scanner_output_error(scanner, stdout, output_path)
+                # Nikto exits with code 1 when security vulnerabilities are detected
+                # Wapiti exits with code 1 when warnings/issues are found
+                is_acceptable_exit = (
+                    p_exit_code == 0
+                    or (scanner == "nikto" and p_exit_code in (0, 1))
+                    or (scanner == "wapiti" and p_exit_code in (0, 1))
+                )
+                if (is_acceptable_exit or has_output) and not output_error:
+                    detail["status"] = "completed"
+                    detail["error"] = None
+                    detail["failure_stage"] = None
+                else:
+                    detail["status"] = "completed" if (has_output and not output_error) else "failed"
+                    detail["error"] = output_error or p_error or f"Process returned exit code {p_exit_code}"
+                    detail["failure_stage"] = "result_validation" if output_error else "process_execution"
                 detail["exit_code"] = p_exit_code
                 detail["completed_at"] = _utc_now()
-                output_error = _scanner_output_error(scanner, stdout, output_path)
-                if detail.get("status") == "completed" and output_error:
-                    detail.update(
-                        status="failed",
-                        error=output_error,
-                        failure_stage="result_validation",
-                    )
-                else:
-                    detail["error"] = p_error
 
             detail["stdout"] = decode_output(stdout) if isinstance(stdout, bytes) else str(stdout or "")
             detail["stderr"] = decode_output(stderr) if isinstance(stderr, bytes) else str(stderr or "")
@@ -961,23 +971,24 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
                 await run_one(scanner)
             except Exception as exc:
                 detail = status_data["scanner_details"][scanner]
-                message = str(exc) or repr(exc) or type(exc).__name__
-                detail.update({
-                    "status": "failed", "completed_at": _utc_now(),
-                    "error": message, "failure_stage": "orchestration",
-                })
-                detail["stderr"] = message
-                detail["duration"] = round(time.perf_counter() - started, 3)
-                detail["execution_seconds"] = detail["duration"]
-                evidence_dir = SCAN_RESULTS_ROOT / scan_id
-                evidence_dir.mkdir(parents=True, exist_ok=True)
-                (evidence_dir / f"{scanner}.txt").touch(exist_ok=True)
-                (evidence_dir / f"{scanner}.stdout.txt").touch(exist_ok=True)
-                (evidence_dir / f"{scanner}.stderr.txt").write_text(message, encoding="utf-8")
-                try:
-                    await update_scanner(scanner, detail)
-                except Exception:
-                    status_data["scanners"][scanner] = "failed"
+                if detail.get("status") != "completed":
+                    message = str(exc) or repr(exc) or type(exc).__name__
+                    detail.update({
+                        "status": "failed", "completed_at": _utc_now(),
+                        "error": message, "failure_stage": "orchestration",
+                    })
+                    detail["stderr"] = message
+                    detail["duration"] = round(time.perf_counter() - started, 3)
+                    detail["execution_seconds"] = detail["duration"]
+                    evidence_dir = SCAN_RESULTS_ROOT / scan_id
+                    evidence_dir.mkdir(parents=True, exist_ok=True)
+                    (evidence_dir / f"{scanner}.txt").touch(exist_ok=True)
+                    (evidence_dir / f"{scanner}.stdout.txt").touch(exist_ok=True)
+                    (evidence_dir / f"{scanner}.stderr.txt").write_text(message, encoding="utf-8")
+                    try:
+                        await update_scanner(scanner, detail)
+                    except Exception:
+                        status_data["scanners"][scanner] = "failed"
 
     wappalyzer_result: Dict[str, Any] = {
         "tool": "Technology Fingerprinting",
@@ -1128,10 +1139,10 @@ async def _run_unified_assessment(scan_id: str, db) -> None:
     }
 
     for scanner in CORE_SCANNERS:
-        if status_data["scanners"].get(scanner) != "completed":
-            continue
         scanner_file = output_dir / f"{scanner}.txt"
         raw_output = scanner_file.read_text(encoding="utf-8", errors="replace") if scanner_file.is_file() else ""
+        if not raw_output.strip() and status_data["scanners"].get(scanner) != "completed":
+            continue
         try:
             if scanner == "nmap":
                 host_discovery_data = extract_nmap_host_discovery(raw_output, normalized_target)
