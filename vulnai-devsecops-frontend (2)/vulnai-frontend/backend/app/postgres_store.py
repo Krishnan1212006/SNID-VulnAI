@@ -1,12 +1,15 @@
 import asyncio
 import copy
 import json
+import logging
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
 from app.core.config import settings
 from app.core.ids import ObjectId
+
+logger = logging.getLogger(__name__)
 
 _TABLE = "vulnai_documents"
 _pool = None
@@ -422,15 +425,12 @@ class PostgresDatabase:
         return PostgresCollection(collection, self.pool)
 
 
-async def connect_to_postgres() -> None:
-    global _pool, _database
-    if not settings.database_url:
-        raise RuntimeError("DATABASE_URL must be set to your Neon Postgres connection string")
+def _initialize_pool(database_url: str):
     from psycopg.rows import dict_row
     from psycopg_pool import ConnectionPool
 
     pool = ConnectionPool(
-        conninfo=settings.database_url,
+        conninfo=database_url,
         kwargs={"row_factory": dict_row, "prepare_threshold": None},
         min_size=1,
         max_size=25,
@@ -440,27 +440,30 @@ async def connect_to_postgres() -> None:
         check=ConnectionPool.check_connection,
         open=False,
     )
+    pool.open(wait=True)
+    with pool.connection() as connection:
+        connection.execute(
+            f"CREATE TABLE IF NOT EXISTS {_TABLE} ("
+            "collection TEXT NOT NULL, id TEXT NOT NULL, data JSONB NOT NULL, "
+            "PRIMARY KEY (collection, id))"
+        )
+        connection.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_data ON {_TABLE} USING GIN (data)"
+        )
+        connection.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{_TABLE}_user_email "
+            f"ON {_TABLE} ((data->>'email')) WHERE collection = 'users'"
+        )
+    return pool
 
-    def initialize() -> None:
-        pool.open(wait=True)
-        with pool.connection() as connection:
-            connection.execute(
-                f"CREATE TABLE IF NOT EXISTS {_TABLE} ("
-                "collection TEXT NOT NULL, id TEXT NOT NULL, data JSONB NOT NULL, "
-                "PRIMARY KEY (collection, id))"
-            )
-            connection.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_{_TABLE}_data ON {_TABLE} USING GIN (data)"
-            )
-            connection.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{_TABLE}_user_email "
-                f"ON {_TABLE} ((data->>'email')) WHERE collection = 'users'"
-            )
 
+async def connect_to_postgres() -> None:
+    global _pool, _database
+    if not settings.database_url:
+        raise RuntimeError("DATABASE_URL must be set to your Neon Postgres connection string")
     try:
-        await asyncio.to_thread(initialize)
+        pool = await asyncio.to_thread(_initialize_pool, settings.database_url)
     except Exception:
-        await asyncio.to_thread(pool.close)
         raise
     _pool = pool
     _database = PostgresDatabase(_pool)
@@ -477,6 +480,16 @@ async def close_postgres_connection() -> None:
 
 
 def get_database() -> PostgresDatabase:
+    global _pool, _database
+    if _database is None and settings.database_url:
+        try:
+            pool = _initialize_pool(settings.database_url)
+            _pool = pool
+            _database = PostgresDatabase(_pool)
+            print("Connected to Neon Postgres (on-demand)")
+        except Exception as exc:
+            logger.warning("On-demand Neon Postgres connection failed: %s", exc)
+
     if _database is None:
         from fastapi import HTTPException
 
