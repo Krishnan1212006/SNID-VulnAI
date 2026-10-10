@@ -43,3 +43,28 @@ async def get_current_user(
         )
 
     return user
+
+
+optional_security_scheme = HTTPBearer(auto_error=False)
+
+async def get_optional_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security_scheme)
+) -> dict | None:
+    if not credentials:
+        return None
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret_key,
+            algorithms=[settings.jwt_algorithm]
+        )
+        user_id = payload.get("sub")
+        if not user_id:
+            return None
+    except (JWTError, ValueError):
+        return None
+
+    db = get_database()
+    return await db.users.find_one({"_id": ObjectId(user_id)})
+
