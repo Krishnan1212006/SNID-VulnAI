@@ -9,6 +9,11 @@ from app.services.device_discovery import (
     parse_arp_table,
     determine_device_type,
     evaluate_device_risk,
+    ACTIVE_JOBS,
+)
+from app.services.network_interfaces import (
+    get_all_network_interfaces,
+    get_network_topology_status,
 )
 
 client = TestClient(app)
@@ -40,7 +45,7 @@ def test_mac_normalization_and_oui_lookup():
 
 
 def test_arp_parser_real_outputs():
-    """Verify parsing Windows and Linux ARP neighbor table formats."""
+    """Verify parsing Windows and Linux ARP neighbor table formats with interface binding."""
     windows_sample = """
 Interface: 192.168.1.50 --- 0x12
   Internet Address      Physical Address      Type
@@ -53,10 +58,12 @@ Interface: 192.168.1.50 --- 0x12
     assert len(parsed) == 2
     assert parsed[0]["ip_address"] == "192.168.1.1"
     assert parsed[0]["mac_address"] == "00:11:22:33:44:55"
+    assert parsed[0]["interface_ip"] == "192.168.1.50"
     assert parsed[0]["entry_type"] == "dynamic"
 
     assert parsed[1]["ip_address"] == "192.168.1.100"
     assert parsed[1]["mac_address"] == "24:0A:C4:99:88:77"
+    assert parsed[1]["interface_ip"] == "192.168.1.50"
 
 
 def test_subnet_authorization_restrictions():
@@ -74,19 +81,25 @@ def test_subnet_authorization_restrictions():
 
 
 def test_device_risk_and_type_rules():
-    """Verify transparent risk evaluation and device type classification."""
-    # Known device
-    assert evaluate_device_risk(is_authorized=True, vendor="Apple", entry_type="dynamic", status="online") == "low"
+    """Verify evidence-based risk evaluation: unknown devices are not auto-flagged HIGH."""
+    # Known/Authorized device
+    assert evaluate_device_risk(is_authorized=True, vendor="Apple") == "low"
 
-    # Unknown device with known vendor
-    assert evaluate_device_risk(is_authorized=False, vendor="Espressif Systems", entry_type="dynamic", status="online") == "medium"
+    # Gateway router
+    assert evaluate_device_risk(is_authorized=False, vendor=None, is_gateway=True) == "low"
 
-    # Unknown device with unknown vendor
-    assert evaluate_device_risk(is_authorized=False, vendor=None, entry_type="dynamic", status="online") == "high"
+    # Unknown device with known vendor (Apple, Intel, etc.)
+    assert evaluate_device_risk(is_authorized=False, vendor="Intel") == "low"
+
+    # Unknown device with unconfirmed vendor: unassessed (needs admin check, not automatically malicious)
+    assert evaluate_device_risk(is_authorized=False, vendor=None) == "unassessed"
+
+    # Genuine confirmed spoof anomaly
+    assert evaluate_device_risk(is_authorized=False, vendor=None, is_spoof_candidate=True) == "high"
 
     # Device type resolution
     assert determine_device_type("Espressif Systems", "esp32-node") == "IoT Sensor"
-    assert determine_device_type("Cisco Systems", "gateway.local") == "Edge Compute"
+    assert determine_device_type("Cisco Systems", "gateway.local", is_gateway=True) == "Edge Compute"
     assert determine_device_type("Hikvision", "cam-01") == "Camera"
     assert determine_device_type(None, None) == "Unclassified"
 
@@ -110,8 +123,8 @@ def test_api_devices_summary_and_empty_state(auth_client, monkeypatch):
     res = auth_client.get("/api/devices/summary")
     assert res.status_code == 200
     data = res.json()
-    assert data["devices_online"] == 0
-    assert data["total_known_devices"] == 0
+    assert data["devices_observed_recently"] == 0
+    assert data["authorized_devices"] == 0
     assert data["unknown_devices"] == 0
     assert data["total_devices"] == 0
 
@@ -124,3 +137,47 @@ def test_unauthorized_discovery_subnet_rejected(auth_client):
     })
     assert res.status_code == 403
     assert "not authorized" in res.json()["detail"].lower()
+
+
+def test_network_interfaces_and_topology_service():
+    """Verify OS network interface detection returns actual host adapter metadata."""
+    adapters = get_all_network_interfaces()
+    assert isinstance(adapters, list)
+    if adapters:
+        ad = adapters[0]
+        assert "name" in ad
+        assert "status" in ad
+        assert "type" in ad
+        assert "ipv4_address" in ad
+
+    status = get_network_topology_status()
+    assert "status" in status
+    assert "sources" in status
+    assert "os_neighbor_table" in status["sources"]
+    assert "router_dhcp_inventory" in status["sources"]
+    assert status["sources"]["router_dhcp_inventory"]["status"] == "not_configured"
+
+
+def test_network_endpoints_api(auth_client):
+    """Verify GET /api/network/interfaces and GET /api/network/status."""
+    res_if = auth_client.get("/api/network/interfaces")
+    assert res_if.status_code == 200
+    assert isinstance(res_if.json(), list)
+
+    res_st = auth_client.get("/api/network/status")
+    assert res_st.status_code == 200
+    data = res_st.json()
+    assert "sources" in data
+    assert "limitations" in data
+
+
+def test_discovery_job_cancellation(auth_client):
+    """Verify cancelling a discovery job via POST /api/devices/discovery/{job_id}/cancel."""
+    job_id = "test-job-cancel-99"
+    ACTIVE_JOBS[job_id] = {"status": "RUNNING", "cancelled": False}
+
+    res = auth_client.post(f"/api/devices/discovery/{job_id}/cancel")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "CANCELLED"
+    assert ACTIVE_JOBS[job_id]["cancelled"] is True

@@ -58,6 +58,7 @@ app.include_router(risk.router, prefix="/api/risk", tags=["Risk"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
 app.include_router(findings.router, prefix="/api/findings", tags=["Findings"])
 app.include_router(snid.router, prefix="/api/snid", tags=["SNID Wireless"])
+app.include_router(network.router, prefix="/api/network", tags=["Network"])
 
 # WebSockets
 app.include_router(websockets.router, tags=["WebSockets"])

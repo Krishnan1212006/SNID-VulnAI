@@ -1,7 +1,9 @@
 """
 Device Inventory and Local Network Discovery Router.
 Provides real device discovery, status tracking, search, and inventory management.
+Zero mock data: all records derived from genuine operating system and network observations.
 """
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -10,41 +12,49 @@ from app.database import get_database
 from app.dependencies import get_current_user
 from app.schemas.iot import DeviceCreate, DeviceUpdate, DiscoveryTriggerRequest
 from app.core.ids import ObjectId
-from app.services.device_discovery import DeviceDiscoveryEngine, is_subnet_authorized
+from app.services.device_discovery import (
+    DeviceDiscoveryEngine,
+    is_subnet_authorized,
+    ACTIVE_JOBS,
+)
 
 router = APIRouter()
 
 
 @router.get("/summary")
 async def get_devices_summary(current_user: dict = Depends(get_current_user)):
-    """Summary metric counts matching dashboard cards (online, known, unknown, high_risk)."""
+    """Summary metric counts matching dashboard cards (observed_recently, authorized, unknown, high_risk)."""
     db = get_database()
     owner_id = str(current_user["_id"])
-    devices = await db.devices.find({"owner_id": owner_id}).to_list(1000)
+    cursor = db.devices.find({"owner_id": owner_id})
+    devices = await cursor.to_list(1000)
 
     # 15 minutes without observation = stale
     fifteen_mins_ago = datetime.now(timezone.utc) - timedelta(minutes=15)
 
-    online_count = 0
+    observed_recently = 0
     stale_count = 0
-    total_known = 0
+    authorized_count = 0
     unknown_count = 0
     high_risk_count = 0
 
     for d in devices:
         last_seen = d.get("last_seen")
-        is_online = d.get("status") == "online"
+        is_recent = False
         if last_seen and isinstance(last_seen, datetime):
-            if last_seen < fifteen_mins_ago and is_online:
-                is_online = False
+            if last_seen >= fifteen_mins_ago:
+                is_recent = True
+            else:
                 stale_count += 1
+        elif d.get("status") == "online":
+            is_recent = True
 
-        if is_online:
-            online_count += 1
+        if is_recent:
+            observed_recently += 1
 
-        classification = d.get("inventory_classification", "unknown").lower()
-        if classification == "authorized":
-            total_known += 1
+        is_auth = d.get("is_authorized", False) or d.get("inventory_classification") == "authorized"
+        if is_auth:
+            authorized_count += 1
         else:
             unknown_count += 1
 
@@ -52,9 +62,11 @@ async def get_devices_summary(current_user: dict = Depends(get_current_user)):
             high_risk_count += 1
 
     return {
-        "devices_online": online_count,
+        "devices_observed_recently": observed_recently,
+        "devices_online": observed_recently,
         "stale_devices": stale_count,
-        "total_known_devices": total_known,
+        "authorized_devices": authorized_count,
+        "total_known_devices": authorized_count,
         "unknown_devices": unknown_count,
         "high_risk_devices": high_risk_count,
         "total_devices": len(devices),
@@ -65,25 +77,33 @@ async def get_devices_summary(current_user: dict = Depends(get_current_user)):
 @router.get("/")
 async def get_devices(
     search: Optional[str] = Query(None, description="Search by name, IP, MAC, hostname, or manufacturer"),
-    status_filter: Optional[str] = Query(None, alias="status", description="Filter by status: online, stale, offline"),
+    status_filter: Optional[str] = Query(None, alias="status", description="Filter by status: online, stale, offline, observed_recently"),
     classification: Optional[str] = Query(None, description="Filter by classification: authorized, unknown, rogue_candidate"),
-    risk: Optional[str] = Query(None, description="Filter by risk: low, medium, high"),
+    risk: Optional[str] = Query(None, description="Filter by risk: low, medium, high, unassessed"),
     limit: int = Query(200, le=500),
     current_user: dict = Depends(get_current_user),
 ):
-    """List discovered network devices with search, filtering, and telemetry status."""
+    """List discovered network devices with search, filtering, and real observation status."""
     db = get_database()
     owner_id = str(current_user["_id"])
     query = {"owner_id": owner_id}
 
     if status_filter:
-        query["status"] = status_filter
+        if status_filter == "online":
+            query["status"] = "online"
+        elif status_filter == "stale":
+            query["status"] = "stale"
+        elif status_filter == "observed_recently":
+            fifteen_mins_ago = datetime.now(timezone.utc) - timedelta(minutes=15)
+            query["last_seen"] = {"$gte": fifteen_mins_ago}
+
     if classification:
         query["inventory_classification"] = classification
     if risk:
         query["risk"] = risk
 
-    devices = await db.devices.find(query).sort("last_seen", -1).to_list(limit)
+    cursor = db.devices.find(query).sort("last_seen", -1)
+    devices = await cursor.to_list(limit)
     formatted = []
     fifteen_mins_ago = datetime.now(timezone.utc) - timedelta(minutes=15)
 
@@ -91,15 +111,22 @@ async def get_devices(
         d["id"] = str(d["_id"])
         d.pop("_id", None)
 
-        # Evaluate stale status dynamically
+        # Dynamic observation status calculation
         last_seen = d.get("last_seen")
-        if last_seen and isinstance(last_seen, datetime) and last_seen < fifteen_mins_ago and d.get("status") == "online":
-            d["status"] = "stale"
+        if last_seen and isinstance(last_seen, datetime):
+            if last_seen < fifteen_mins_ago:
+                d["observation_status"] = "stale"
+                d["status"] = "stale"
+            else:
+                d["observation_status"] = "observed_recently"
+                d["status"] = "online"
+        else:
+            d["observation_status"] = d.get("observation_status", "observed_recently")
 
         # Apply in-memory text search if provided
         if search:
             q = search.lower().strip()
-            text_pool = f"{d.get('name', '')} {d.get('ip_address', '')} {d.get('mac_address', '')} {d.get('hostname', '')} {d.get('manufacturer', '')}".lower()
+            text_pool = f"{d.get('name', '')} {d.get('ip_address', '')} {d.get('mac_address', '')} {d.get('hostname', '')} {d.get('manufacturer', '')} {d.get('interface_name', '')}".lower()
             if q not in text_pool:
                 continue
 
@@ -115,7 +142,7 @@ async def initiate_discovery(
 ):
     """
     Initiate real network device discovery job for an explicitly authorized local subnet.
-    Strictly verifies authorization to prevent unpermitted active network scanning.
+    Enforces RFC 1918 private range authorization.
     """
     db = get_database()
     owner_id = str(current_user["_id"])
@@ -123,12 +150,14 @@ async def initiate_discovery(
     if request.authorized_subnet and not is_subnet_authorized(request.authorized_subnet):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Subnet '{request.authorized_subnet}' is not authorized. Authorized subnets: RFC 1918 private ranges (192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12).",
+            detail=f"Subnet '{request.authorized_subnet}' is not authorized. Authorized scopes: RFC 1918 private ranges (192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12).",
         )
 
+    job_id = f"job-{uuid.uuid4().hex[:10]}"
     engine = DeviceDiscoveryEngine(db, owner_id)
     try:
         summary = await engine.run_discovery_job(
+            job_id=job_id,
             authorized_subnet=request.authorized_subnet,
             active_sweep=request.active_sweep,
         )
@@ -141,16 +170,35 @@ async def initiate_discovery(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Discovery failed: {exc}")
 
 
+@router.post("/discovery/{job_id}/cancel")
+async def cancel_discovery_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Cancel an active or running network discovery job."""
+    if job_id in ACTIVE_JOBS:
+        ACTIVE_JOBS[job_id]["cancelled"] = True
+        ACTIVE_JOBS[job_id]["status"] = "CANCELLED"
+        return {"message": "Discovery job cancellation requested", "job_id": job_id, "status": "CANCELLED"}
+    return {"message": "Job not running or already completed", "job_id": job_id}
+
+
 @router.get("/discovery/{job_id}")
 async def get_discovery_job(
     job_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    """Retrieve audit record and result of a specific discovery job."""
+    """Retrieve audit record, state, and results of a discovery job."""
     db = get_database()
     owner_id = str(current_user["_id"])
 
-    job = await db.discovery_jobs.find_one({"_id": ObjectId(job_id), "owner_id": owner_id})
+    # Check active memory registry first
+    if job_id in ACTIVE_JOBS:
+        return ACTIVE_JOBS[job_id]
+
+    job = await db.discovery_jobs.find_one({"job_id": job_id, "owner_id": owner_id})
+    if not job:
+        job = await db.discovery_jobs.find_one({"_id": ObjectId(job_id), "owner_id": owner_id})
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discovery job not found")
     job["id"] = str(job["_id"])
@@ -188,6 +236,8 @@ async def create_device(
     dev_dict["owner_id"] = owner_id
     dev_dict["first_seen"] = datetime.now(timezone.utc)
     dev_dict["last_seen"] = datetime.now(timezone.utc)
+    dev_dict["observation_timestamp"] = datetime.now(timezone.utc)
+    dev_dict["last_successful_observation"] = datetime.now(timezone.utc)
 
     res = await db.devices.insert_one(dev_dict)
     dev_dict["id"] = str(res.inserted_id)
