@@ -7,6 +7,7 @@ import { useAuth } from "../context/AuthContext";
 const PAGE_META = {
   "/dashboard": { title: "Security Briefing", subtitle: "Your overall posture, assembled from every scan" },
   "/scan": { title: "New Assessment", subtitle: "A safe, passive review of an authorized target" },
+  "/domain-assessment": { title: "Domain Security Assessment", subtitle: "DNS, HTTP/TLS, Technology Fingerprinting, Nmap & SQLi Assessment" },
   "/vulnerabilities": { title: "Findings", subtitle: "Every vulnerability identified across your scans" },
   "/reports": { title: "Reports", subtitle: "Export scan results as PDF, JSON or CSV" },
   "/devices": { title: "Network Register", subtitle: "Devices discovered on the monitored network" },

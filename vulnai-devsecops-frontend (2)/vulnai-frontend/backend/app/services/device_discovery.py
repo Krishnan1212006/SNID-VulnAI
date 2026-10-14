@@ -219,18 +219,68 @@ def evaluate_device_risk(
     """
     Calculate evidence-based device risk:
     - Unknown does NOT automatically mean HIGH risk.
-    - Authorized device or Default Gateway: low
-    - Unknown device with recognized vendor (Apple, Intel, etc.): low
-    - Unknown device with unrecognized vendor: unassessed (needs admin check, not automatically malicious)
+    - An unknown identity without verified malicious evidence is unassessed.
+    - Default Gateway: low
+    - Explicitly authorized device: low
+    - Recognized legitimate hardware vendor: low
+    - Unknown device without recognized vendor: unassessed
     - Confirmed anomaly (spoof candidate or rogue AP): high
     """
     if is_spoof_candidate:
         return "high"
-    if is_authorized or is_gateway:
+    if is_gateway or is_authorized:
         return "low"
-    if vendor:
+    if vendor and vendor.lower() not in ("unknown vendor", "unknown", "unrecognized"):
         return "low"
     return "unassessed"
+
+
+async def nmap_discover_hosts(subnet_cidr: str, timeout: float = 20.0) -> list[dict[str, Any]]:
+    """
+    Execute Nmap host discovery (-sn) over authorized local subnet.
+    Extracts responding IP addresses, PTR hostnames, and MAC/vendors.
+    """
+    try:
+        from app.services.scanner_runtime import ScannerRuntime
+        import xml.etree.ElementTree as ET
+        runtime = ScannerRuntime()
+        cmd = ["nmap", "-sn", subnet_cidr, "-oX", "-"]
+        res = await runtime.capture_runtime(cmd, timeout=timeout)
+        if res.status != "completed" or not res.stdout:
+            return []
+
+        root = ET.fromstring(res.stdout.decode("utf-8", errors="ignore"))
+        discovered = []
+        for host in root.findall("host"):
+            status_elem = host.find("status")
+            if status_elem is None or status_elem.get("state") != "up":
+                continue
+
+            ipv4 = None
+            mac = None
+            vendor = None
+            for addr in host.findall("address"):
+                atype = addr.get("addrtype")
+                if atype == "ipv4":
+                    ipv4 = addr.get("addr")
+                elif atype == "mac":
+                    mac = normalize_mac(addr.get("addr"))
+                    vendor = addr.get("vendor")
+
+            hostnames = [hn.get("name") for hn in host.findall(".//hostname") if hn.get("name")]
+            hostname = hostnames[0] if hostnames else None
+
+            if ipv4:
+                discovered.append({
+                    "ip_address": ipv4,
+                    "mac_address": mac,
+                    "manufacturer": vendor,
+                    "hostname": hostname,
+                    "source": "nmap",
+                })
+        return discovered
+    except Exception:
+        return []
 
 
 class DeviceDiscoveryEngine:
@@ -250,7 +300,7 @@ class DeviceDiscoveryEngine:
         Run modular discovery pipeline:
         1. Check active host network interfaces.
         2. Inspect OS ARP/neighbor cache.
-        3. Optional authorized rate-limited ping sweep to refresh neighbor table.
+        3. Optional authorized Nmap host discovery and rate-limited ping sweep.
         4. OUI vendor and PTR hostname resolution.
         5. Real observation status: observed_recently, stale, unreachable.
         6. Upsert into database without duplicates.
@@ -273,7 +323,6 @@ class DeviceDiscoveryEngine:
         # Use interface subnet if no subnet explicitly passed
         target_subnet = authorized_subnet
         if not target_subnet and primary_adapter and primary_adapter.get("network_cidr"):
-            # Only use if /24 or smaller
             try:
                 net = ipaddress.ip_network(primary_adapter["network_cidr"], strict=False)
                 if net.num_addresses <= 256:
@@ -281,16 +330,24 @@ class DeviceDiscoveryEngine:
             except Exception:
                 pass
 
-        if active_sweep and target_subnet:
+        nmap_hosts: list[dict[str, Any]] = []
+        if target_subnet:
             if not is_subnet_authorized(target_subnet):
                 ACTIVE_JOBS[job_id]["status"] = "FAILED"
                 raise PermissionError(f"Subnet {target_subnet} is not in the configured authorized subnets.")
 
-            sources_used.append("active_icmp_sweep")
-            await active_sweep_subnet(
-                target_subnet,
-                cancel_check=lambda: ACTIVE_JOBS.get(job_id, {}).get("cancelled", False),
-            )
+            # Try Nmap host discovery first
+            nmap_results = await nmap_discover_hosts(target_subnet, timeout=18.0)
+            if nmap_results:
+                sources_used.append("nmap_host_discovery")
+                nmap_hosts = nmap_results
+
+            if active_sweep and not nmap_hosts:
+                sources_used.append("active_icmp_sweep")
+                await active_sweep_subnet(
+                    target_subnet,
+                    cancel_check=lambda: ACTIVE_JOBS.get(job_id, {}).get("cancelled", False),
+                )
 
         if ACTIVE_JOBS.get(job_id, {}).get("cancelled", False):
             ACTIVE_JOBS[job_id]["status"] = "CANCELLED"
@@ -298,6 +355,19 @@ class DeviceDiscoveryEngine:
 
         # Read actual OS neighbor records
         raw_records = await asyncio.to_thread(get_local_arp_records)
+
+        # Merge Nmap discovered hosts
+        known_ips = {r["ip_address"] for r in raw_records}
+        for nh in nmap_hosts:
+            if nh["ip_address"] not in known_ips:
+                raw_records.append({
+                    "ip_address": nh["ip_address"],
+                    "mac_address": nh.get("mac_address"),
+                    "interface_ip": primary_adapter.get("ipv4_address") if primary_adapter else None,
+                    "entry_type": "nmap_probe",
+                    "raw_line": f"Nmap host discovery: {nh['ip_address']} ({nh.get('hostname') or 'no PTR'})",
+                })
+
         discovered_count = 0
         updated_count = 0
 
@@ -322,8 +392,9 @@ class DeviceDiscoveryEngine:
             if authorized_subnet and not is_subnet_authorized(ip, [authorized_subnet]):
                 continue
 
-            vendor = lookup_vendor(mac) if mac else None
-            hostname = await resolve_hostname(ip)
+            nmap_match = next((nh for nh in nmap_hosts if nh.get("ip_address") == ip), None)
+            vendor = (lookup_vendor(mac) if mac else None) or (nmap_match.get("manufacturer") if nmap_match else None)
+            hostname = (nmap_match.get("hostname") if nmap_match and nmap_match.get("hostname") else None) or await resolve_hostname(ip)
             device_type = determine_device_type(vendor, hostname, is_gateway=is_gateway)
 
             # Query existing device by MAC or IP to prevent duplicate entries

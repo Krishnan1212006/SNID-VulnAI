@@ -14,7 +14,8 @@ import {
   X,
   ClipboardList,
   Cpu,
-  History
+  History,
+  Globe
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 
@@ -28,6 +29,7 @@ const NAV_SECTIONS = [
     items: [
       { to: "/scan", label: "New Scan", icon: ScanLine },
       { to: "/last-scan", label: "Last Scan Records", icon: History },
+      { to: "/domain-assessment", label: "Domain Assessment", icon: Globe },
       { to: "/vulnerabilities", label: "Vulnerabilities", icon: ShieldAlert },
       { to: "/reports", label: "Reports", icon: FileText },
     ],

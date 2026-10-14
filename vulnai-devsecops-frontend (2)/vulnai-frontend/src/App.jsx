@@ -20,6 +20,7 @@ import Monitoring from "./pages/Monitoring";
 import AuditLogs from "./pages/AuditLogs";
 import ScanComparison from "./pages/ScanComparison";
 import LastScanRecords from "./pages/LastScanRecords";
+import DomainAssessment from "./pages/DomainAssessment";
 
 export default function App() {
   return (
@@ -40,6 +41,7 @@ export default function App() {
               <Route path="/scan" element={<ScanPage />} />
               <Route path="/last-scan" element={<LastScanRecords />} />
               <Route path="/last-scan-records" element={<Navigate to="/last-scan" replace />} />
+              <Route path="/domain-assessment" element={<DomainAssessment />} />
               <Route path="/vulnerabilities" element={<Vulnerabilities />} />
               <Route path="/vulnerabilities/:id" element={<VulnerabilityDetails />} />
               <Route path="/scans/:current_id/compare/:previous_id" element={<ScanComparison />} />

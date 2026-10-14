@@ -280,6 +280,16 @@ export default function Devices() {
     }
   };
 
+  const handleClearInventory = async () => {
+    if (!window.confirm("Are you sure you want to clear the discovered devices inventory?")) return;
+    try {
+      await api.delete("/devices/");
+      await loadData();
+    } catch (err) {
+      console.error("Failed to clear devices inventory:", err);
+    }
+  };
+
   // Filtered devices list
   const filteredDevices = useMemo(() => {
     return devices.filter((d) => {
@@ -378,6 +388,14 @@ export default function Devices() {
               className="flex items-center gap-1.5 rounded-xl border border-cyan-400 bg-cyan-950/60 px-3.5 py-2 text-xs font-bold text-cyan-300 hover:bg-cyan-900/60 hover:shadow-[0_0_15px_rgba(0,240,255,0.4)] transition-all"
             >
               <Play size={13} className="text-cyan-400" /> Run Discovery
+            </button>
+
+            <button
+              onClick={handleClearInventory}
+              className="flex items-center gap-1.5 rounded-xl border border-rose-500/30 bg-rose-950/20 px-3 py-2 text-xs font-bold text-rose-300 hover:bg-rose-900/30 hover:border-rose-500/60 transition-all"
+              title="Clear discovered device records"
+            >
+              <X size={13} className="text-rose-400" /> Clear
             </button>
 
             <button

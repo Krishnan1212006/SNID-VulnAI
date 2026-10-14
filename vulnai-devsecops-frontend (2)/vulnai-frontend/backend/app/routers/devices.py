@@ -5,7 +5,7 @@ Zero mock data: all records derived from genuine operating system and network ob
 """
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.database import get_database
@@ -19,6 +19,21 @@ from app.services.device_discovery import (
 )
 
 router = APIRouter()
+
+
+def parse_dt(val: Any) -> Optional[datetime]:
+    """Safely parse datetime object or ISO formatted timestamp string."""
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    if isinstance(val, str):
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
 
 
 @router.get("/summary")
@@ -39,15 +54,15 @@ async def get_devices_summary(current_user: dict = Depends(get_current_user)):
     high_risk_count = 0
 
     for d in devices:
-        last_seen = d.get("last_seen")
+        last_seen = parse_dt(d.get("last_seen"))
         is_recent = False
-        if last_seen and isinstance(last_seen, datetime):
+        if last_seen:
             if last_seen >= fifteen_mins_ago:
                 is_recent = True
             else:
                 stale_count += 1
-        elif d.get("status") == "online":
-            is_recent = True
+        else:
+            stale_count += 1
 
         if is_recent:
             observed_recently += 1
@@ -58,7 +73,8 @@ async def get_devices_summary(current_user: dict = Depends(get_current_user)):
         else:
             unknown_count += 1
 
-        if d.get("risk") == "high":
+        risk_val = (d.get("risk") or "unassessed").lower()
+        if risk_val == "high":
             high_risk_count += 1
 
     return {
@@ -112,8 +128,8 @@ async def get_devices(
         d.pop("_id", None)
 
         # Dynamic observation status calculation
-        last_seen = d.get("last_seen")
-        if last_seen and isinstance(last_seen, datetime):
+        last_seen = parse_dt(d.get("last_seen"))
+        if last_seen:
             if last_seen < fifteen_mins_ago:
                 d["observation_status"] = "stale"
                 d["status"] = "stale"
@@ -121,7 +137,8 @@ async def get_devices(
                 d["observation_status"] = "observed_recently"
                 d["status"] = "online"
         else:
-            d["observation_status"] = d.get("observation_status", "observed_recently")
+            d["observation_status"] = "stale"
+            d["status"] = "stale"
 
         # Apply in-memory text search if provided
         if search:
@@ -133,6 +150,15 @@ async def get_devices(
         formatted.append(d)
 
     return formatted
+
+
+@router.delete("/")
+async def clear_devices_inventory(current_user: dict = Depends(get_current_user)):
+    """Clear all discovered device inventory records for current user."""
+    db = get_database()
+    owner_id = str(current_user["_id"])
+    result = await db.devices.delete_many({"owner_id": owner_id})
+    return {"message": "Device inventory cleared", "deleted_count": result.deleted_count}
 
 
 @router.post("/discovery")
