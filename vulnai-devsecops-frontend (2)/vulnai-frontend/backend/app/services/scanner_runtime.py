@@ -2,12 +2,23 @@
 
 import asyncio
 import os
+import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from app.core.config import settings
+
+INSTALL_HINTS = {
+    "nmap": "sudo apt update && sudo apt install -y nmap",
+    "nikto": "sudo apt update && sudo apt install -y nikto (or Docker image: sullo/nikto:latest)",
+    "wapiti": "sudo apt update && sudo apt install -y wapiti",
+    "sqlmap": "sudo apt update && sudo apt install -y sqlmap",
+    "gobuster": "sudo apt update && sudo apt install -y gobuster",
+    "wappalyzer": "Built-in Python technology detector; optional CLI: npm install -g wappalyzer-cli",
+}
 
 
 @dataclass
@@ -113,18 +124,39 @@ class ScannerRuntime:
         timeout: Optional[float] = None,
         on_process_created: Optional[Any] = None,
     ) -> CommandResult:
-        """Run a scanner command without artificial limits, streaming output live and supporting cancellation."""
+        """Run a scanner command, streaming output live and supporting timeout and cancellation.
+
+        This method never raises: every failure is returned as a ``CommandResult`` with a
+        terminal status (``failed``, ``timed_out`` or ``cancelled``).
+
+        On Windows (and whenever the running event loop cannot spawn subprocesses, e.g. the
+        ``SelectorEventLoop`` that ``uvicorn --reload`` installs) a thread-based ``Popen``
+        streamer is used instead of ``asyncio.create_subprocess_exec``.
+        """
         started = time.perf_counter()
-        cmd_list = list(command)
+        cmd_list = [str(part) for part in command]
+
+        if os.name == "nt":
+            return await self._run_streaming_threaded(
+                cmd_list, on_stdout, on_stderr, cancel_event, timeout, on_process_created, started
+            )
 
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd_list,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except NotImplementedError:
+            return await self._run_streaming_threaded(
+                cmd_list, on_stdout, on_stderr, cancel_event, timeout, on_process_created, started
             )
         except (OSError, ValueError) as exc:
             return CommandResult("failed", None, b"", b"", str(exc) or repr(exc), time.perf_counter() - started)
+        except Exception as exc:  # defensive: never let a spawn error escape
+            return CommandResult("failed", None, b"", b"", f"{type(exc).__name__}: {exc}", time.perf_counter() - started)
 
         if on_process_created:
             try:
@@ -159,7 +191,6 @@ class ScannerRuntime:
         stderr_task = asyncio.create_task(read_stream(process.stderr, True))
         wait_task = asyncio.create_task(process.wait())
 
-        # Build monitor coroutine
         status = "completed"
         error_msg = None
 
@@ -194,24 +225,159 @@ class ScannerRuntime:
         except Exception as exc:
             self._terminate_process_tree(process)
             status = "failed"
-            error_msg = str(exc)
+            error_msg = str(exc) or repr(exc)
         finally:
             if cancel_task and not cancel_task.done():
                 cancel_task.cancel()
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-
-        full_stdout = b"".join(stdout_chunks)
-        full_stderr = b"".join(stderr_chunks)
-        code = process.returncode
+            if not wait_task.done():
+                wait_task.cancel()
+            # Bound the drain so a grandchild that inherited the pipes cannot hang the job.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(stdout_task, stderr_task, return_exceptions=True), timeout=10
+                )
+            except asyncio.TimeoutError:
+                stdout_task.cancel()
+                stderr_task.cancel()
 
         return CommandResult(
             status=status,
-            exit_code=code,
-            stdout=full_stdout,
-            stderr=full_stderr,
+            exit_code=process.returncode,
+            stdout=b"".join(stdout_chunks),
+            stderr=b"".join(stderr_chunks),
             error=error_msg,
             duration=time.perf_counter() - started,
         )
+
+    async def _run_streaming_threaded(
+        self,
+        command: list[str],
+        on_stdout: Optional[Any],
+        on_stderr: Optional[Any],
+        cancel_event: Optional[asyncio.Event],
+        timeout: Optional[float],
+        on_process_created: Optional[Any],
+        started: float,
+    ) -> CommandResult:
+        """Run the blocking streamer in a worker thread so any event-loop policy works."""
+        try:
+            return await asyncio.to_thread(
+                self._run_streaming_sync, command, on_stdout, on_stderr, cancel_event, timeout, on_process_created, started
+            )
+        except asyncio.CancelledError:
+            # The awaiting task was cancelled; make sure the worker's child process is not orphaned.
+            if cancel_event is not None:
+                try:
+                    cancel_event.set()
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            return CommandResult("failed", None, b"", b"", f"{type(exc).__name__}: {exc}", time.perf_counter() - started)
+
+    def _run_streaming_sync(
+        self,
+        command: list[str],
+        on_stdout: Optional[Any],
+        on_stderr: Optional[Any],
+        cancel_event: Optional[asyncio.Event],
+        timeout: Optional[float],
+        on_process_created: Optional[Any],
+        started: float,
+    ) -> CommandResult:
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        try:
+            process = subprocess.Popen(command, **popen_kwargs)
+        except (OSError, ValueError) as exc:
+            return CommandResult("failed", None, b"", b"", str(exc) or repr(exc), time.perf_counter() - started)
+        except Exception as exc:
+            return CommandResult("failed", None, b"", b"", f"{type(exc).__name__}: {exc}", time.perf_counter() - started)
+
+        if on_process_created:
+            try:
+                on_process_created(process)
+            except Exception:
+                pass
+
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+
+        def pump(stream: Any, bucket: list[bytes], callback: Optional[Any]) -> None:
+            try:
+                for line in iter(stream.readline, b""):
+                    bucket.append(line)
+                    if callback:
+                        try:
+                            callback(decode_output(line))
+                        except Exception:
+                            pass
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        readers = [
+            threading.Thread(target=pump, args=(process.stdout, stdout_chunks, on_stdout), daemon=True),
+            threading.Thread(target=pump, args=(process.stderr, stderr_chunks, on_stderr), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+
+        status = "completed"
+        error_msg: Optional[str] = None
+        deadline = (time.monotonic() + timeout) if timeout else None
+        try:
+            while True:
+                try:
+                    code = process.wait(timeout=0.25)
+                    status = "completed" if code == 0 else "failed"
+                    error_msg = None if code == 0 else f"Command exited with code {code}"
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if cancel_event is not None and cancel_event.is_set():
+                    status = "cancelled"
+                    error_msg = "Scan was cancelled by the user"
+                    self._terminate_process_tree(process)
+                    process.wait()
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    status = "timed_out"
+                    error_msg = f"Scanner exceeded the safety limit of {timeout}s"
+                    self._terminate_process_tree(process)
+                    process.wait()
+                    break
+        except Exception as exc:
+            self._terminate_process_tree(process)
+            status = "failed"
+            error_msg = f"{type(exc).__name__}: {exc}"
+        finally:
+            for reader in readers:
+                reader.join(timeout=10)
+
+        return CommandResult(
+            status=status,
+            exit_code=process.returncode,
+            stdout=b"".join(stdout_chunks),
+            stderr=b"".join(stderr_chunks),
+            error=error_msg,
+            duration=time.perf_counter() - started,
+        )
+
 
     async def run_command(self, command: Sequence[str], timeout: Optional[float] = None) -> CommandResult:
         """Run an already built command without an arbitrary timeout limit unless explicitly specified."""
@@ -369,8 +535,117 @@ class ScannerRuntime:
             result["stdout"] = decode_output(ready.stdout)
             result["stderr"] = decode_output(ready.stderr)
 
+    async def _probe_scanner_version(self, scanner: str, binary: str) -> Optional[str]:
+        version_commands = {
+            "nmap": ([binary, "--version"], r"Nmap version\s+([^\s]+)"),
+            "nikto": ([binary, "-Version"], r"Nikto\s+([0-9.]+)"),
+            "wapiti": ([binary, "--version"], r"([0-9.]+)"),
+            "sqlmap": ([binary, "--version"], r"([0-9.]+[^\s]*)"),
+            "gobuster": ([binary, "--help"], r"VERSION:\s*([0-9.]+)"),
+        }
+        if scanner not in version_commands:
+            return None
+        cmd, pattern = version_commands[scanner]
+        try:
+            res = await self.capture_runtime(cmd, timeout=5)
+            out = decode_output(res.stdout) or decode_output(res.stderr)
+            match = re.search(pattern, out)
+            if match:
+                return match.group(1).strip()
+            for line in out.splitlines():
+                if line.strip():
+                    return line.strip()
+        except Exception:
+            pass
+        return None
+
+    async def preflight(self, scanners: dict[str, dict[str, object]]) -> dict:
+        """Inspect WSL and each executable without installing or scanning anything."""
+        result = {
+            "status": "available",
+            "runtime": "wsl" if self.uses_wsl else "local",
+            "distribution": self.distribution if self.uses_wsl else None,
+            "wsl_available": not self.uses_wsl,
+            "distribution_installed": not self.uses_wsl,
+            "distribution_state_before_command": "not_applicable" if not self.uses_wsl else "unknown",
+            "command_executable": not self.uses_wsl,
+            "stdout": "",
+            "stderr": "",
+            "error": None,
+            "probes": {},
+            "scanners": {},
+        }
+
+        if self.uses_wsl:
+            wsl_status = await self.capture_host(["wsl.exe", "--status"])
+            result["wsl_available"] = wsl_status.status == "completed"
+            result["stdout"] = decode_output(wsl_status.stdout)
+            result["stderr"] = decode_output(wsl_status.stderr)
+            result["probes"]["wsl_status"] = {
+                "exit_code": wsl_status.exit_code,
+                "stdout": decode_output(wsl_status.stdout),
+                "stderr": decode_output(wsl_status.stderr),
+                "error": wsl_status.error,
+            }
+            if not result["wsl_available"]:
+                result.update(status="unavailable", error=wsl_status.error or result["stderr"] or "WSL is unavailable")
+                return self._unavailable_scanners(result, scanners, "wsl_unavailable")
+
+            listing = await self.capture_host(["wsl.exe", "-l", "-q"])
+            listing_stdout = decode_output(listing.stdout)
+            listing_stderr = decode_output(listing.stderr)
+            result["probes"]["distribution_list"] = {
+                "exit_code": listing.exit_code,
+                "stdout": listing_stdout,
+                "stderr": listing_stderr,
+                "error": listing.error,
+            }
+            names = self._distribution_names("\n".join(part for part in (listing_stdout, listing_stderr) if part))
+            if listing.status != "completed":
+                listing_text = "\n".join((listing_stdout, listing_stderr)).casefold()
+                if not names and ("no installed distributions" in listing_text or "no distributions" in listing_text):
+                    result.update(status="unavailable", distribution_installed=False,
+                                  error=f"Required WSL distribution '{self.distribution}' is not installed",
+                                  stdout=listing_stdout, stderr=listing_stderr)
+                    return self._unavailable_scanners(result, scanners, "distribution_missing")
+                result.update(status="unavailable", error=listing.error or result["stderr"] or "Unable to list WSL distributions")
+                return self._unavailable_scanners(result, scanners, "distribution_list_failed")
+            result["distribution_installed"] = any(name.casefold() == self.distribution.casefold() for name in names)
+            if not result["distribution_installed"]:
+                result.update(status="unavailable", error=f"Required WSL distribution '{self.distribution}' is not installed",
+                              stdout=listing_stdout, stderr=listing_stderr or result["stderr"])
+                return self._unavailable_scanners(result, scanners, "distribution_missing")
+
+            state_result = await self.capture_host(["wsl.exe", "-l", "-v"])
+            state_stdout = decode_output(state_result.stdout)
+            state_stderr = decode_output(state_result.stderr)
+            result["probes"]["distribution_state"] = {
+                "exit_code": state_result.exit_code,
+                "stdout": state_stdout,
+                "stderr": state_stderr,
+                "error": state_result.error,
+            }
+            result["distribution_state_before_command"] = self._distribution_state(
+                "\n".join(part for part in (state_stdout, state_stderr) if part), self.distribution
+            )
+            ready = await self.capture_runtime(["bash", "-lc", "printf VULNAI_WSL_READY"])
+            result["probes"]["distribution_command"] = {
+                "exit_code": ready.exit_code,
+                "stdout": decode_output(ready.stdout),
+                "stderr": decode_output(ready.stderr),
+                "error": ready.error,
+            }
+            result["command_executable"] = ready.status == "completed" and b"VULNAI_WSL_READY" in ready.stdout
+            if not result["command_executable"]:
+                result.update(status="unavailable", error=ready.error or decode_output(ready.stderr) or "Ubuntu could not execute a command",
+                              stdout=decode_output(ready.stdout), stderr=decode_output(ready.stderr))
+                return self._unavailable_scanners(result, scanners, "distribution_command_failed")
+            result["stdout"] = decode_output(ready.stdout)
+            result["stderr"] = decode_output(ready.stderr)
+
         for scanner, spec in scanners.items():
-            binary = str(spec["binary"])
+            configured_path = getattr(settings, f"scanner_path_{scanner}", None)
+            binary = str(configured_path or spec.get("binary") or scanner)
             probe = await self.capture_runtime(["bash", "-lc", f"command -v {binary}"])
             found_path = decode_output(probe.stdout) if probe.status == "completed" else ""
             available = probe.status == "completed" and bool(found_path)
@@ -378,12 +653,18 @@ class ScannerRuntime:
                 f"Scanner binary '{binary}' is missing from {self.distribution if self.uses_wsl else 'PATH'}"
                 if probe.exit_code == 1 else (probe.error or decode_output(probe.stderr) or "Scanner binary check failed")
             )
+            version = None
+            if available:
+                version = await self._probe_scanner_version(scanner, binary)
+            install_hint = INSTALL_HINTS.get(scanner, f"Install {binary} in your environment")
             result["scanners"][scanner] = {
                 "scanner": scanner,
                 "available": available,
                 "status": "available" if available else "unavailable",
                 "binary": binary,
                 "path": found_path or None,
+                "version": version,
+                "install_hint": install_hint,
                 "stdout": decode_output(probe.stdout),
                 "stderr": decode_output(probe.stderr),
                 "exit_code": probe.exit_code,
@@ -417,6 +698,32 @@ class ScannerRuntime:
             "status": "not_required", "runtime": "docker", "scanners": {}
         }
         scanner_status = {**wsl_status.get("scanners", {}), **docker_status.get("scanners", {})}
+
+        # Include wappalyzer technology engine status if present in specs
+        if "wappalyzer" in scanners:
+            wapp_available = True
+            wapp_version = "1.0.0 (embedded Python engine)"
+            try:
+                from app.scanners.wappalyzer_scanner import WappalyzerScanner
+            except ImportError:
+                wapp_available = False
+                wapp_version = None
+            scanner_status["wappalyzer"] = {
+                "scanner": "wappalyzer",
+                "available": wapp_available,
+                "status": "available" if wapp_available else "unavailable",
+                "runtime": "python",
+                "binary": "wappalyzer",
+                "path": "embedded:app.scanners.wappalyzer_scanner",
+                "version": wapp_version,
+                "install_hint": INSTALL_HINTS.get("wappalyzer"),
+                "stdout": "",
+                "stderr": "",
+                "exit_code": 0 if wapp_available else 1,
+                "error": None if wapp_available else "WappalyzerScanner module missing",
+                "reason": None if wapp_available else "module_missing",
+            }
+
         available = [item.get("available") for item in scanner_status.values()]
         return {
             "status": "available" if available and all(available) else ("partial" if any(available) else "unavailable"),
@@ -451,6 +758,8 @@ class ScannerRuntime:
                 "status": "available" if available else "unavailable", "runtime": "docker",
                 "image": image, "stdout": decode_output(probe.stdout), "stderr": decode_output(probe.stderr),
                 "exit_code": probe.exit_code,
+                "version": None,
+                "install_hint": f"docker pull {image}",
                 "error": None if available else (probe.error or decode_output(probe.stderr) or f"Docker image '{image}' is unavailable"),
                 "reason": None if available else "docker_image_missing",
             }
@@ -467,7 +776,9 @@ class ScannerRuntime:
         runtime["scanners"] = {
             name: {
                 "scanner": name, "available": False, "status": "unavailable", "runtime": "docker",
-                "image": str(spec["image"]), "stdout": runtime.get("stdout", ""),
+                "image": str(spec.get("image", "")), "stdout": runtime.get("stdout", ""),
+                "version": None,
+                "install_hint": INSTALL_HINTS.get(name, f"docker pull {spec.get('image', '')}"),
                 "stderr": runtime.get("stderr", ""), "exit_code": None,
                 "error": runtime.get("error"), "reason": reason,
             }
@@ -481,8 +792,10 @@ class ScannerRuntime:
                 "scanner": name,
                 "available": False,
                 "status": "unavailable",
-                "binary": str(spec["binary"]),
+                "binary": str(spec.get("binary", name)),
                 "path": None,
+                "version": None,
+                "install_hint": INSTALL_HINTS.get(name, f"Install {name}"),
                 "stdout": runtime.get("stdout", ""),
                 "stderr": runtime.get("stderr", ""),
                 "exit_code": None,
@@ -492,6 +805,7 @@ class ScannerRuntime:
             for name, spec in scanners.items()
         }
         return runtime
+
 
     @staticmethod
     def _distribution_names(output: str) -> list[str]:

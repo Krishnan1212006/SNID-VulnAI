@@ -20,6 +20,24 @@ class Settings(BaseSettings):
     nikto_docker_image: str = "sullo/nikto:latest"
     scanner_docker_command: str = "docker"
 
+    # Bounded concurrency and per-tool execution ceilings (seconds). Each is additionally
+    # capped by scan_job_timeout_seconds. Override with env vars, e.g. SCANNER_TIMEOUT_NMAP=300.
+    scanner_max_concurrency: int = 5
+    scanner_timeout_nmap: int = 900
+    scanner_timeout_nikto: int = 900
+    scanner_timeout_wapiti: int = 1200
+    scanner_timeout_sqlmap: int = 1200
+    scanner_timeout_gobuster: int = 900
+    scanner_timeout_wappalyzer: int = 120
+
+    # Optional explicit executable paths, resolved INSIDE the scanner runtime (WSL distro on
+    # Windows, host PATH on Linux). Example: SCANNER_PATH_NMAP=/usr/local/bin/nmap
+    scanner_path_nmap: str | None = None
+    scanner_path_nikto: str | None = None
+    scanner_path_wapiti: str | None = None
+    scanner_path_sqlmap: str | None = None
+    scanner_path_gobuster: str | None = None
+
     allow_private_targets: bool = False
     lab_mode: bool = False
 

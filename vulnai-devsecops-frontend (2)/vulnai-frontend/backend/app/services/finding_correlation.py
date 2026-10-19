@@ -9,6 +9,7 @@ import re
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime, timezone
 from app.models.finding import UnifiedFinding, FindingVerification
+from app.services.mitre_attack import map_finding_to_mitre
 
 def _canonical_key_for_finding(finding: Dict[str, Any], scanner: str) -> Optional[str]:
     """Determine a canonical key for cross-scanner deduplication."""
@@ -309,6 +310,7 @@ def correlate_and_deduplicate_findings(
             "corroborated_by": bucket["detected_by"],
             "details": bucket["evidence_entries"]
         }
+        mitre_info = map_finding_to_mitre(bucket)
         unified = UnifiedFinding(
             id=bucket["id"],
             title=bucket["title"],
@@ -331,7 +333,8 @@ def correlate_and_deduplicate_findings(
             raw_evidence_files=bucket["raw_files"],
             scan_id=scan_id,
             asset_id=asset_id,
-            owner_id=owner_id
+            owner_id=owner_id,
+            mitre_attack=mitre_info,
         )
         correlated.append(unified)
 

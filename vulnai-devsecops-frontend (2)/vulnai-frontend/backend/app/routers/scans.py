@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 import os
 from app.core.ids import ObjectId
 from app.services.scan_job_manager import scan_job_manager
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Response
 from fastapi.responses import HTMLResponse
 from app.database import get_database
 from app.dependencies import get_current_user
@@ -230,6 +230,38 @@ async def get_scans(current_user: dict = Depends(get_current_user)):
 async def get_scanner_runtime_status(current_user: dict = Depends(get_current_user)):
     """Check WSL and scanner executables without starting a scan."""
     return await scanner_runtime.preflight_matrix(SCANNER_BINARIES)
+
+
+@router.get("/diagnostics")
+async def get_scanner_diagnostics(current_user: dict = Depends(get_current_user)):
+    """Diagnostic report displaying runtime, tool availability, versions, configured paths and installation hints without launching a scan."""
+    matrix = await scanner_runtime.preflight_matrix(SCANNER_BINARIES)
+    return {
+        "status": matrix.get("status"),
+        "os": os.name,
+        "runtime_type": "wsl" if os.name == "nt" else "local",
+        "wsl_distribution": settings.scanner_wsl_distribution,
+        "docker_command": settings.scanner_docker_command,
+        "configured_paths": {
+            "nmap": settings.scanner_path_nmap,
+            "nikto": settings.scanner_path_nikto,
+            "wapiti": settings.scanner_path_wapiti,
+            "sqlmap": settings.scanner_path_sqlmap,
+            "gobuster": settings.scanner_path_gobuster,
+            "wappalyzer": settings.wappalyzer_path,
+        },
+        "timeouts": {
+            "nmap": settings.scanner_timeout_nmap,
+            "nikto": settings.scanner_timeout_nikto,
+            "wapiti": settings.scanner_timeout_wapiti,
+            "sqlmap": settings.scanner_timeout_sqlmap,
+            "gobuster": settings.scanner_timeout_gobuster,
+            "wappalyzer": settings.scanner_timeout_wappalyzer,
+            "job_safety_limit": settings.scan_job_timeout_seconds,
+        },
+        "details": matrix,
+    }
+
 NIKTO_RESULT = SCAN_RESULTS_ROOT / "nikto.json"
 GOBUSTER_RESULT = SCAN_RESULTS_ROOT / "gobuster.txt"
 
@@ -503,11 +535,35 @@ async def get_assessment_status(scan_id: str, current_user: dict = Depends(get_c
 
     duration_value = _compute_scan_duration(scan, live_job)
 
+    current_progress = scan.get("progress", 0)
+    if live_job and live_job.overall_progress > current_progress:
+        current_progress = live_job.overall_progress
+
+    # Calculate actual finished status from tools
+    terminal_states = {"completed", "failed", "timed_out", "timeout", "unavailable", "skipped", "cancelled"}
+    total_tools = len(scanners) if scanners else 6
+    finished_tools = sum(1 for s in scanners.values() if s in terminal_states)
+    if finished_tools > 0 and total_tools > 0:
+        calc_prog = int((finished_tools * 100) / total_tools)
+        if calc_prog > current_progress:
+            current_progress = calc_prog
+
+    status_val = scan.get("status", "unknown")
+    if live_job and live_job.status in ("completed", "failed", "cancelled") and status_val == "running":
+        status_val = live_job.status
+    elif finished_tools == total_tools and total_tools > 0 and status_val == "running":
+        if any(s == "cancelled" for s in scanners.values()):
+            status_val = "cancelled"
+        elif all(s == "completed" for s in scanners.values()):
+            status_val = "completed"
+        else:
+            status_val = "failed"
+
     return {
         "scan_id": scan_id,
         "target": scan.get("target_url"),
-        "status": scan.get("status", "unknown"),
-        "progress": scan.get("progress", 0),
+        "status": status_val,
+        "progress": current_progress,
         "scanners": scanners,
         "scanner_details": scanner_details,
         "runtime_status": scan.get("runtime_status"),
@@ -554,7 +610,19 @@ async def get_scan_tools(scan_id: str, current_user: dict = Depends(get_current_
         pj = persisted_map.get(tool_name, {})
         live_tool = live_job.tools.get(tool_name) if live_job else None
 
-        status = (live_tool.status if live_tool else None) or pj.get("status") or detail.get("status") or scanner_status.get(tool_name) or "queued"
+        # Prioritize terminal state over stale running state
+        status = None
+        if live_tool and live_tool.status in ("completed", "failed", "cancelled", "timed_out", "incomplete"):
+            status = live_tool.status
+        elif pj.get("status") in ("completed", "failed", "cancelled", "timed_out", "incomplete"):
+            status = pj.get("status")
+        elif detail.get("status") in ("completed", "failed", "cancelled", "timed_out", "incomplete"):
+            status = detail.get("status")
+        elif scanner_status.get(tool_name) in ("completed", "failed", "cancelled", "timed_out", "incomplete"):
+            status = scanner_status.get(tool_name)
+        else:
+            status = (live_tool.status if live_tool else None) or pj.get("status") or detail.get("status") or scanner_status.get(tool_name) or "queued"
+
 
         if live_tool and live_tool.status == "running":
             duration = live_tool.elapsed_seconds()
@@ -630,6 +698,78 @@ async def get_assessment_results(scan_id: str, current_user: dict = Depends(get_
             }
         raise HTTPException(status_code=409, detail="Unified assessment results are not ready")
     return scan["combined_results"]
+
+
+@router.get("/{scan_id}/mitre-navigator")
+async def get_scan_mitre_navigator(scan_id: str, current_user: dict = Depends(get_current_user)):
+    """Return standard MITRE ATT&CK Navigator Layer JSON (v4.5) for direct visualization."""
+    db = get_database()
+    try:
+        scan_object_id = ObjectId(scan_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid scan ID") from exc
+
+    scan = await db.scans.find_one({"_id": scan_object_id, "owner_id": str(current_user["_id"])})
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    combined = scan.get("combined_results")
+    if not combined:
+        from app.services.unified_scan import compile_scan_results_from_disk
+        compiled_scan, _ = await compile_scan_results_from_disk(scan_id, db=db)
+        if compiled_scan and compiled_scan.get("combined_results"):
+            combined = compiled_scan["combined_results"]
+
+    target = scan.get("target_url") or "Target"
+    layer = None
+    if combined and "mitre_attack" in combined:
+        layer = combined["mitre_attack"].get("navigator_layer")
+
+    if not layer:
+        from app.services.mitre_attack import build_mitre_navigator_layer
+        findings = []
+        if combined:
+            findings = [*combined.get("confirmed", []), *combined.get("potential", []), *combined.get("informational", [])]
+        layer = build_mitre_navigator_layer(findings, scan_id=scan_id, target=target)
+
+    return Response(
+        content=json.dumps(layer, indent=2),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="mitre-attack-navigator-{scan_id}.json"'
+        }
+    )
+
+
+@router.get("/{scan_id}/mitre-matrix")
+async def get_scan_mitre_matrix(scan_id: str, current_user: dict = Depends(get_current_user)):
+    """Return structured MITRE ATT&CK Enterprise Tactics matrix with active technique findings."""
+    db = get_database()
+    try:
+        scan_object_id = ObjectId(scan_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid scan ID") from exc
+
+    scan = await db.scans.find_one({"_id": scan_object_id, "owner_id": str(current_user["_id"])})
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    combined = scan.get("combined_results")
+    if not combined:
+        from app.services.unified_scan import compile_scan_results_from_disk
+        compiled_scan, _ = await compile_scan_results_from_disk(scan_id, db=db)
+        if compiled_scan and compiled_scan.get("combined_results"):
+            combined = compiled_scan["combined_results"]
+
+    if combined and "mitre_attack" in combined:
+        return combined["mitre_attack"].get("matrix", {})
+
+    from app.services.mitre_attack import get_mitre_tactics_matrix
+    findings = []
+    if combined:
+        findings = [*combined.get("confirmed", []), *combined.get("potential", []), *combined.get("informational", [])]
+    return get_mitre_tactics_matrix(findings)
+
 
 @router.get("/latest", response_model=Optional[ScanResponse])
 async def get_latest_scan(current_user: dict = Depends(get_current_user)):

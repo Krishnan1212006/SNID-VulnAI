@@ -18,6 +18,7 @@ import {
 import { scanCheckSteps } from "../data/mockData";
 import api from "../lib/api";
 import { useNotifications } from "../context/NotificationContext";
+import MitreAttackMatrix from "../components/MitreAttackMatrix";
 
 const STATE = { IDLE: "idle", VALIDATING: "validating", SCANNING: "scanning", DONE: "done" };
 const PRIVATE_RANGES = ["127.", "10.", "192.168.", "169.254.", "0.0.0.0", "localhost", "169.254.169.254"];
@@ -982,8 +983,14 @@ export default function ScanPage() {
                                 <p className="break-words font-semibold text-slate-200">
                                   {observation.title || observation.path || observation.message}
                                 </p>
-                                <p className="text-slate-500">
-                                  Tool: <span className="font-semibold uppercase text-cyan-400">{observation.scanner}</span> · Status: {observation.verification_status || observation.status || "unverified"}
+                                <p className="text-slate-500 flex flex-wrap items-center gap-1.5">
+                                  <span>Tool: <span className="font-semibold uppercase text-cyan-400">{observation.scanner}</span></span>
+                                  <span>· Status: {observation.verification_status || observation.status || "unverified"}</span>
+                                  {observation.mitre_attack?.technique_id && (
+                                    <span className="rounded bg-cyan-950/80 border border-cyan-500/30 px-1.5 py-0.5 text-[10px] font-mono text-cyan-300">
+                                      MITRE: {observation.mitre_attack.technique_id} ({observation.mitre_attack.tactic_name})
+                                    </span>
+                                  )}
                                 </p>
                                 {observation.status_code != null && (
                                   <p className="font-mono text-slate-400">
@@ -1001,6 +1008,17 @@ export default function ScanPage() {
                     );
                   })}
                 </div>
+
+                {/* MITRE ATT&CK Threat Posture & Navigator Integration */}
+                <MitreAttackMatrix
+                  scanId={scanId || scanResult?.id}
+                  mitreData={assessmentResults?.mitre_attack || scanResult?.mitre_attack}
+                  findings={[
+                    ...(assessmentResults?.confirmed || []),
+                    ...(assessmentResults?.potential || []),
+                    ...(assessmentResults?.informational || []),
+                  ]}
+                />
 
                 {/* Raw Scanner Output Details */}
                 <section className="rounded-xl border border-slate-800 bg-[#03060D]/80 p-4 text-xs">

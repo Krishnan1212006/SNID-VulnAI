@@ -52,6 +52,7 @@ class UnifiedFinding(BaseModel):
     first_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     asset_id: Optional[str] = None
     owner_id: Optional[str] = None
+    mitre_attack: Optional[Dict[str, Any]] = Field(default=None, description="MITRE ATT&CK tactic, technique, and mitigations mapping")
 
     def to_dict(self) -> Dict[str, Any]:
         sev_upper = self.severity.upper()
@@ -113,6 +114,7 @@ class UnifiedFinding(BaseModel):
             "raw_evidence_files": self.raw_evidence_files,
             "asset_id": self.asset_id,
             "owner_id": self.owner_id,
+            "mitre_attack": self.mitre_attack,
             "ai_analysis": {
                 "priority": sev_upper.lower(),
                 "problem": self.description or self.title,

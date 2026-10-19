@@ -176,6 +176,23 @@ class ScanJobManager:
             tool.duration = round(time.perf_counter() - tool.start_time_monotonic, 2)
         tool.process = None
 
+        # Recompute live overall progress and state from all registered tools
+        terminal_states = {"completed", "failed", "timed_out", "timeout", "unavailable", "skipped", "cancelled"}
+        finished = sum(1 for t in ctx.tools.values() if t.status in terminal_states)
+        total = len(ctx.tools)
+        if total > 0:
+            ctx.overall_progress = int((finished * 100) / total)
+
+        if finished == total and total > 0:
+            if any(t.status == "cancelled" for t in ctx.tools.values()):
+                ctx.status = "cancelled"
+            elif all(t.status == "completed" for t in ctx.tools.values()):
+                ctx.status = "completed"
+            else:
+                ctx.status = "failed"
+            ctx.completed_at = _utc_now_iso()
+            ctx.duration = ctx.elapsed_seconds()
+
     def terminate_process_safe(self, process: Any) -> None:
         """Safely terminate a process and all its child processes to prevent zombies."""
         if not process:
@@ -204,7 +221,7 @@ class ScanJobManager:
             except Exception:
                 pass
 
-    async def cancel_scan(self, scan_id: str) -> bool:
+    def cancel_scan(self, scan_id: str) -> bool:
         """Cancel a running scan and safely terminate all underlying child processes."""
         ctx = self._scans.get(scan_id)
         if not ctx:
@@ -214,6 +231,7 @@ class ScanJobManager:
         ctx.status = "cancelled"
         ctx.completed_at = _utc_now_iso()
         ctx.duration = ctx.elapsed_seconds()
+        ctx.overall_progress = 100
 
         for name, tool in ctx.tools.items():
             if tool.status in {"queued", "running"}:
@@ -226,6 +244,7 @@ class ScanJobManager:
                 tool.process = None
 
         return True
+
 
     def get_tool_states(self, scan_id: str) -> Dict[str, Dict[str, Any]]:
         ctx = self._scans.get(scan_id)
